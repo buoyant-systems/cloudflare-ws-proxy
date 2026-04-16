@@ -17,7 +17,7 @@ export { ProxyDO };
 // Constants
 // ---------------------------------------------------------------------------
 
-const TOPIC_ID_REGEX = /^[a-zA-Z0-9_-]{1,128}$/;
+const TOPIC_ID_REGEX = /^[a-zA-Z0-9_.:~-]{1,128}$/;
 
 // ---------------------------------------------------------------------------
 // Worker fetch handler
@@ -249,7 +249,7 @@ function validateTopicId(topicId: string): Response | null {
   if (!TOPIC_ID_REGEX.test(topicId)) {
     return Response.json(
       {
-        error: "Invalid topic ID. Must match /^[a-zA-Z0-9_-]{1,128}$/",
+        error: "Invalid topic ID. Must match /^[a-zA-Z0-9_.:~-]{1,128}$/",
       },
       { status: 400 }
     );

@@ -237,10 +237,11 @@ curl -X DELETE https://your-worker.workers.dev/topic/my-topic \
 
 ## Topic ID Format
 
-Topic IDs must match: `^[a-zA-Z0-9_-]{1,128}$`
+Topic IDs must match: `^[a-zA-Z0-9_.:~-]{1,128}$`
 
-- Alphanumeric characters, hyphens, and underscores only
+- Alphanumeric characters, hyphens, underscores, dots, colons, and tildes
 - 1 to 128 characters
+- Supports namespaced patterns like `user:123`, `chat.room.5`, `org~team`
 - Invalid IDs return `400 Bad Request`
 
 ## How Costs Stay Low

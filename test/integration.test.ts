@@ -87,6 +87,16 @@ describe("Worker — topic ID validation", () => {
     });
     expect(response.status).toBe(200);
   });
+
+  it("accepts topic IDs with dots, colons, and tildes", async () => {
+    for (const topic of ["user:123", "chat.room.5", "org~team"]) {
+      const response = await SELF.fetch(`https://proxy/topic/${topic}/auth`, {
+        method: "POST",
+        headers: authHeaders(),
+      });
+      expect(response.status).toBe(200);
+    }
+  });
 });
 
 // ---------------------------------------------------------------------------
