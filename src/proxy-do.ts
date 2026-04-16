@@ -99,7 +99,8 @@ export class ProxyDO extends DurableObject<Env> {
     }
 
     const webSocketPair = new WebSocketPair();
-    const [client, server] = Object.values(webSocketPair);
+    const client = webSocketPair[0];
+    const server = webSocketPair[1];
 
     // Accept via hibernation API
     this.ctx.acceptWebSocket(server);
@@ -346,5 +347,6 @@ function extractTopicId(url: URL): string {
   // URL path is /.../topic/:id/...
   const parts = url.pathname.split("/");
   const topicIndex = parts.indexOf("topic");
-  return topicIndex >= 0 && parts[topicIndex + 1] ? parts[topicIndex + 1] : "unknown";
+  const topicId = topicIndex >= 0 ? parts[topicIndex + 1] : undefined;
+  return topicId ?? "unknown";
 }

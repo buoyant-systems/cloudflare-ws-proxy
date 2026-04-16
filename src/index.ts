@@ -97,15 +97,18 @@ async function handleAuth(
 
   if (request.headers.get("Content-Type")?.includes("application/json")) {
     try {
-      const body = (await request.json()) as {
-        token_ttl_seconds?: number;
-        cursor?: number;
-      };
-      if (typeof body.token_ttl_seconds === "number" && body.token_ttl_seconds > 0) {
-        tokenTtlSeconds = body.token_ttl_seconds;
-      }
-      if (typeof body.cursor === "number") {
-        cursor = body.cursor;
+      const text = await request.text();
+      if (text.length > 0) {
+        const body = JSON.parse(text) as {
+          token_ttl_seconds?: number;
+          cursor?: number;
+        };
+        if (typeof body.token_ttl_seconds === "number" && body.token_ttl_seconds > 0) {
+          tokenTtlSeconds = body.token_ttl_seconds;
+        }
+        if (typeof body.cursor === "number") {
+          cursor = body.cursor;
+        }
       }
     } catch {
       return Response.json({ error: "Invalid JSON body" }, { status: 400 });

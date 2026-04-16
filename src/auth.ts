@@ -23,8 +23,8 @@ export interface TokenPayload {
 // Helpers
 // ---------------------------------------------------------------------------
 
-function base64UrlEncode(data: ArrayBuffer): string {
-  const bytes = new Uint8Array(data);
+function base64UrlEncode(data: ArrayBuffer | Uint8Array): string {
+  const bytes = data instanceof Uint8Array ? data : new Uint8Array(data);
   let binary = "";
   for (const byte of bytes) {
     binary += String.fromCharCode(byte);

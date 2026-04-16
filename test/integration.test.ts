@@ -1,10 +1,8 @@
 import {
   env,
-  createExecutionContext,
   SELF,
 } from "cloudflare:test";
 import { describe, it, expect } from "vitest";
-import worker from "../src/index";
 
 // The BACKEND_SECRET must match what is set in .dev.vars or wrangler.jsonc [vars]
 // For tests, we rely on the vitest-pool-workers config to pick up the test env.
@@ -15,6 +13,11 @@ function authHeaders(): HeadersInit {
     Authorization: `Bearer ${BACKEND_SECRET}`,
     "Content-Type": "application/json",
   };
+}
+
+/** Generate a unique topic ID per test to avoid cross-contamination (isolated storage is off). */
+function uniqueTopic(prefix: string): string {
+  return `${prefix}-${crypto.randomUUID().slice(0, 8)}`;
 }
 
 // ---------------------------------------------------------------------------
@@ -37,14 +40,16 @@ describe("Worker — health check", () => {
 
 describe("Worker — backend auth", () => {
   it("rejects requests without Authorization header", async () => {
-    const response = await SELF.fetch("https://proxy/topic/test/auth", {
+    const topic = uniqueTopic("auth-noheader");
+    const response = await SELF.fetch(`https://proxy/topic/${topic}/auth`, {
       method: "POST",
     });
     expect(response.status).toBe(401);
   });
 
   it("rejects requests with wrong secret", async () => {
-    const response = await SELF.fetch("https://proxy/topic/test/auth", {
+    const topic = uniqueTopic("auth-wrong");
+    const response = await SELF.fetch(`https://proxy/topic/${topic}/auth`, {
       method: "POST",
       headers: { Authorization: "Bearer wrong-secret" },
     });
@@ -75,7 +80,8 @@ describe("Worker — topic ID validation", () => {
   });
 
   it("accepts valid topic IDs", async () => {
-    const response = await SELF.fetch("https://proxy/topic/valid-Topic_123/auth", {
+    const topic = uniqueTopic("valid-Topic_123");
+    const response = await SELF.fetch(`https://proxy/topic/${topic}/auth`, {
       method: "POST",
       headers: authHeaders(),
     });
@@ -89,7 +95,8 @@ describe("Worker — topic ID validation", () => {
 
 describe("Worker — POST /topic/:id/auth", () => {
   it("returns a WebSocket URL with a signed token", async () => {
-    const response = await SELF.fetch("https://proxy/topic/my-topic/auth", {
+    const topic = uniqueTopic("auth-url");
+    const response = await SELF.fetch(`https://proxy/topic/${topic}/auth`, {
       method: "POST",
       headers: authHeaders(),
     });
@@ -100,13 +107,14 @@ describe("Worker — POST /topic/:id/auth", () => {
       topic_id: string;
       expires_at: number;
     }>();
-    expect(body.topic_id).toBe("my-topic");
-    expect(body.url).toContain("/topic/my-topic/connect?token=");
+    expect(body.topic_id).toBe(topic);
+    expect(body.url).toContain(`/topic/${topic}/connect?token=`);
     expect(body.expires_at).toBeGreaterThan(Date.now());
   });
 
   it("respects custom token_ttl_seconds", async () => {
-    const response = await SELF.fetch("https://proxy/topic/my-topic/auth", {
+    const topic = uniqueTopic("auth-ttl");
+    const response = await SELF.fetch(`https://proxy/topic/${topic}/auth`, {
       method: "POST",
       headers: authHeaders(),
       body: JSON.stringify({ token_ttl_seconds: 60 }),
@@ -124,7 +132,8 @@ describe("Worker — POST /topic/:id/auth", () => {
 
 describe("Worker — POST /topic/:id/publish", () => {
   it("publishes a text message and returns a sequence number", async () => {
-    const response = await SELF.fetch("https://proxy/topic/pub-test/publish", {
+    const topic = uniqueTopic("pub-text");
+    const response = await SELF.fetch(`https://proxy/topic/${topic}/publish`, {
       method: "POST",
       headers: authHeaders(),
       body: JSON.stringify({ message: "hello" }),
@@ -137,12 +146,13 @@ describe("Worker — POST /topic/:id/publish", () => {
       connections: number;
     }>();
     expect(body.seq).toBeGreaterThanOrEqual(0);
-    expect(body.topic_id).toBe("pub-test");
+    expect(body.topic_id).toBe(topic);
     expect(typeof body.connections).toBe("number");
   });
 
   it("publishes a base64-encoded message", async () => {
-    const response = await SELF.fetch("https://proxy/topic/pub-bin/publish", {
+    const topic = uniqueTopic("pub-b64");
+    const response = await SELF.fetch(`https://proxy/topic/${topic}/publish`, {
       method: "POST",
       headers: authHeaders(),
       body: JSON.stringify({
@@ -154,7 +164,8 @@ describe("Worker — POST /topic/:id/publish", () => {
   });
 
   it("rejects publish without a message field", async () => {
-    const response = await SELF.fetch("https://proxy/topic/pub-err/publish", {
+    const topic = uniqueTopic("pub-nomsg");
+    const response = await SELF.fetch(`https://proxy/topic/${topic}/publish`, {
       method: "POST",
       headers: authHeaders(),
       body: JSON.stringify({}),
@@ -163,16 +174,16 @@ describe("Worker — POST /topic/:id/publish", () => {
   });
 
   it("returns incrementing sequence numbers", async () => {
-    const topicId = "seq-test-" + crypto.randomUUID().slice(0, 8);
+    const topic = uniqueTopic("pub-seq");
 
-    const r1 = await SELF.fetch(`https://proxy/topic/${topicId}/publish`, {
+    const r1 = await SELF.fetch(`https://proxy/topic/${topic}/publish`, {
       method: "POST",
       headers: authHeaders(),
       body: JSON.stringify({ message: "first" }),
     });
     const b1 = await r1.json<{ seq: number }>();
 
-    const r2 = await SELF.fetch(`https://proxy/topic/${topicId}/publish`, {
+    const r2 = await SELF.fetch(`https://proxy/topic/${topic}/publish`, {
       method: "POST",
       headers: authHeaders(),
       body: JSON.stringify({ message: "second" }),
@@ -189,14 +200,16 @@ describe("Worker — POST /topic/:id/publish", () => {
 
 describe("Worker — DELETE /topic/:id", () => {
   it("deletes a topic and returns success", async () => {
+    const topic = uniqueTopic("del");
+
     // First publish a message to ensure the DO exists
-    await SELF.fetch("https://proxy/topic/del-test/publish", {
+    await SELF.fetch(`https://proxy/topic/${topic}/publish`, {
       method: "POST",
       headers: authHeaders(),
       body: JSON.stringify({ message: "to be deleted" }),
     });
 
-    const response = await SELF.fetch("https://proxy/topic/del-test", {
+    const response = await SELF.fetch(`https://proxy/topic/${topic}`, {
       method: "DELETE",
       headers: { Authorization: `Bearer ${BACKEND_SECRET}` },
     });
@@ -208,7 +221,7 @@ describe("Worker — DELETE /topic/:id", () => {
       connections_closed: number;
     }>();
     expect(body.deleted).toBe(true);
-    expect(body.topic_id).toBe("del-test");
+    expect(body.topic_id).toBe(topic);
   });
 });
 
@@ -218,15 +231,17 @@ describe("Worker — DELETE /topic/:id", () => {
 
 describe("Worker — GET /topic/:id/connect", () => {
   it("rejects connect without a token", async () => {
-    const response = await SELF.fetch("https://proxy/topic/my-topic/connect", {
+    const topic = uniqueTopic("conn-notoken");
+    const response = await SELF.fetch(`https://proxy/topic/${topic}/connect`, {
       method: "GET",
     });
     expect(response.status).toBe(401);
   });
 
   it("rejects connect with an invalid token", async () => {
+    const topic = uniqueTopic("conn-badtoken");
     const response = await SELF.fetch(
-      "https://proxy/topic/my-topic/connect?token=invalid.token",
+      `https://proxy/topic/${topic}/connect?token=invalid.token`,
       { method: "GET" }
     );
     expect(response.status).toBe(401);
