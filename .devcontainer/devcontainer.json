@@ -13,23 +13,18 @@
       "username": "vscode",
       "upgradePackages": "false"
     },
-    "ghcr.io/devcontainers/features/node:1": {},
-    "ghcr.io/rails/devcontainer/features/sqlite3:1": {}
+    "ghcr.io/devcontainers/features/node:1": {}
   },
   "customizations": {
     "antigravity": {
       "settings": {
         "antigravity.agent.dockerPath": "/usr/bin/docker"
       },
-      "extensions": [
-        "golang.go"
-      ]
+      "extensions": []
     },
     "vscode": {
-      "extensions": [
-        "golang.go"
-      ]
+      "extensions": []
     }
   },
-  "postCreateCommand": "git config --global --add safe.directory /workspaces/cloudflare-ws-proxy"
+  "postCreateCommand": "git config --global --add safe.directory /workspaces/cloudflare-ws-proxy && cd /workspaces/cloudflare-ws-proxy && npm install"
 }

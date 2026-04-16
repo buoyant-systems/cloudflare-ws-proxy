@@ -1,0 +1,30 @@
+{
+  "name": "cloudflare-ws-proxy",
+  "version": "0.1.0",
+  "description": "A deployable Cloudflare Worker template that proxies messages from serverless backends to browser clients via WebSocket-hibernated Durable Objects.",
+  "main": "src/index.ts",
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "types": "wrangler types",
+    "test": "vitest run",
+    "test:watch": "vitest"
+  },
+  "keywords": [
+    "cloudflare",
+    "workers",
+    "durable-objects",
+    "websocket",
+    "proxy",
+    "serverless",
+    "hibernation"
+  ],
+  "license": "MIT",
+  "devDependencies": {
+    "@cloudflare/vitest-pool-workers": "^0.8.0",
+    "@cloudflare/workers-types": "^4.20260401.0",
+    "typescript": "^5.8.0",
+    "vitest": "^3.1.0",
+    "wrangler": "^4.10.0"
+  }
+}

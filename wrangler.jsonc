@@ -1,0 +1,25 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "cloudflare-ws-proxy",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-04-16",
+  "compatibility_flags": ["nodejs_compat"],
+
+  // Durable Object binding — the ProxyDO class handles WebSocket hibernation
+  "durable_objects": {
+    "bindings": [
+      {
+        "name": "PROXY_DO",
+        "class_name": "ProxyDO"
+      }
+    ]
+  },
+
+  // SQLite-backed storage (modern default, more efficient than legacy KV)
+  "migrations": [
+    {
+      "tag": "v1",
+      "new_sqlite_classes": ["ProxyDO"]
+    }
+  ]
+}
