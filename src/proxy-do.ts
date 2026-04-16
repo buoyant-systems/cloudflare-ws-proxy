@@ -27,6 +27,7 @@ interface StoredMessage {
 
 interface TopicMeta {
   nextSeq: number;
+  oldestSeq: number;
   maxBufferSize: number;
   messageTtlMs: number;
 }
@@ -165,15 +166,20 @@ export class ProxyDO extends DurableObject<Env> {
       timestamp: Date.now(),
     };
 
-    // Store the message and updated metadata
+    // Store the message
     await this.ctx.storage.put(`msg:${seq}`, storedMessage);
-    await this.ctx.storage.put("meta", meta);
 
-    // Prune oldest messages if buffer exceeds max
+    // Prune oldest messages if buffer exceeds max (mutates meta.oldestSeq)
     await this.pruneBuffer(meta);
 
-    // Set alarm for TTL-based cleanup
-    await this.ctx.storage.setAlarm(Date.now() + ttlMs);
+    // Save metadata after pruning (oldestSeq may have changed)
+    await this.ctx.storage.put("meta", meta);
+
+    // Set alarm for TTL-based cleanup — only if none is pending
+    const existingAlarm = await this.ctx.storage.getAlarm();
+    if (existingAlarm === null) {
+      await this.ctx.storage.setAlarm(Date.now() + ttlMs);
+    }
 
     // Broadcast to all connected WebSockets
     const envelope = JSON.stringify({
@@ -254,28 +260,38 @@ export class ProxyDO extends DurableObject<Env> {
     const now = Date.now();
     const cutoff = now - meta.messageTtlMs;
 
-    // Scan all stored messages and delete expired ones
-    const entries = await this.ctx.storage.list<StoredMessage>({ prefix: "msg:" });
-    let earliestRemainingTimestamp = Infinity;
-    let hasMessages = false;
+    // Walk sequentially from oldest — messages are ordered by time
+    const keysToDelete: string[] = [];
+    let firstSurvivorTimestamp: number | null = null;
 
-    for (const [key, msg] of entries) {
+    for (let seq = meta.oldestSeq; seq < meta.nextSeq; seq++) {
+      const msg = await this.ctx.storage.get<StoredMessage>(`msg:${seq}`);
+      if (!msg) {
+        // Gap — already deleted (e.g. by pruneBuffer), skip
+        continue;
+      }
       if (msg.timestamp <= cutoff) {
-        await this.ctx.storage.delete(key);
+        keysToDelete.push(`msg:${seq}`);
       } else {
-        hasMessages = true;
-        if (msg.timestamp < earliestRemainingTimestamp) {
-          earliestRemainingTimestamp = msg.timestamp;
-        }
+        firstSurvivorTimestamp = msg.timestamp;
+        break; // messages are sequential in time — no more expired
       }
     }
 
-    if (hasMessages) {
+    if (keysToDelete.length > 0) {
+      await this.ctx.storage.delete(keysToDelete);
+      meta.oldestSeq = meta.oldestSeq + keysToDelete.length;
+      await this.ctx.storage.put("meta", meta);
+    }
+
+    const remaining = meta.nextSeq - meta.oldestSeq;
+
+    if (remaining > 0 && firstSurvivorTimestamp !== null) {
       // Reschedule alarm for the next message expiry
-      const nextAlarmTime = earliestRemainingTimestamp + meta.messageTtlMs;
+      const nextAlarmTime = firstSurvivorTimestamp + meta.messageTtlMs;
       await this.ctx.storage.setAlarm(Math.max(nextAlarmTime, now + 1000));
-    } else {
-      // No messages, no connections → full cleanup for zero-cost state
+    } else if (remaining <= 0) {
+      // No messages left — if no connections, full cleanup for zero-cost state
       const sockets = this.ctx.getWebSockets();
       if (sockets.length === 0) {
         await this.ctx.storage.deleteAll();
@@ -292,6 +308,7 @@ export class ProxyDO extends DurableObject<Env> {
     return (
       meta ?? {
         nextSeq: 0,
+        oldestSeq: 0,
         maxBufferSize: DEFAULT_MAX_BUFFER_SIZE,
         messageTtlMs: DEFAULT_MESSAGE_TTL_MS,
       }
@@ -299,30 +316,33 @@ export class ProxyDO extends DurableObject<Env> {
   }
 
   private async pruneBuffer(meta: TopicMeta): Promise<void> {
-    const entries = await this.ctx.storage.list<StoredMessage>({ prefix: "msg:" });
-
-    if (entries.size <= meta.maxBufferSize) {
-      return;
+    const count = meta.nextSeq - meta.oldestSeq;
+    if (count <= meta.maxBufferSize) {
+      return; // No scan needed — simple arithmetic check
     }
 
-    // Sort by seq ascending and delete the oldest
-    const sorted = [...entries.entries()].sort((a, b) => a[1].seq - b[1].seq);
-    const toDelete = sorted.length - meta.maxBufferSize;
-
-    for (let i = 0; i < toDelete; i++) {
-      await this.ctx.storage.delete(sorted[i]![0]);
+    // Calculate which sequences to delete and batch-delete them
+    const newOldest = meta.nextSeq - meta.maxBufferSize;
+    const keysToDelete: string[] = [];
+    for (let seq = meta.oldestSeq; seq < newOldest; seq++) {
+      keysToDelete.push(`msg:${seq}`);
     }
+
+    if (keysToDelete.length > 0) {
+      await this.ctx.storage.delete(keysToDelete);
+    }
+
+    meta.oldestSeq = newOldest;
   }
 
   private async replayMessages(ws: WebSocket, cursor: number): Promise<void> {
-    const entries = await this.ctx.storage.list<StoredMessage>({ prefix: "msg:" });
+    const meta = await this.getMeta();
+    // Start from the cursor or the oldest available message, whichever is later
+    const start = Math.max(cursor, meta.oldestSeq);
 
-    // Sort by seq ascending and replay messages at or after the cursor
-    const sorted = [...entries.values()]
-      .filter((msg) => msg.seq >= cursor)
-      .sort((a, b) => a.seq - b.seq);
-
-    for (const msg of sorted) {
+    for (let seq = start; seq < meta.nextSeq; seq++) {
+      const msg = await this.ctx.storage.get<StoredMessage>(`msg:${seq}`);
+      if (!msg) continue; // gap from TTL expiry
       try {
         ws.send(
           JSON.stringify({
