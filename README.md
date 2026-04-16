@@ -2,8 +2,6 @@
 
 A deployable Cloudflare Worker template that proxies messages from serverless backends (e.g. Google Cloud Run, AWS Lambda) to browser clients via WebSocket connections held open at the edge — at near-zero cost when idle.
 
-[![Deploy to Cloudflare Workers](https://deploy.workers.cloudflare.com/button)](https://deploy.workers.cloudflare.com/?url=https://github.com/buoyant-systems/cloudflare-ws-proxy)
-
 ## The Problem
 
 Serverless platforms like Cloud Run charge for active container time and have request timeout limits. Keeping thousands of long-lived WebSocket connections open directly against your serverless instances is expensive and fragile.
@@ -29,38 +27,40 @@ Serverless platforms like Cloud Run charge for active container time and have re
                                          │   during hibernation
 ```
 
-## Quick Start
+## Deploy
 
-### 1. Clone and install
+### One-off deploy (no repo to maintain)
 
-```bash
-# Using the Cloudflare CLI (recommended)
-npm create cloudflare@latest my-proxy -- --template https://github.com/buoyant-systems/cloudflare-ws-proxy
-
-# Or clone directly
-git clone https://github.com/buoyant-systems/cloudflare-ws-proxy.git
-cd cloudflare-ws-proxy
-npm install
-```
-
-### 2. Set your backend secret
+Copy-paste this to deploy directly to your Cloudflare account. No fork, no CI/CD — just a running Worker.
 
 ```bash
-npx wrangler secret put BACKEND_SECRET
-# Enter a strong, random secret — this authenticates your backend
-```
-
-### 3. Deploy
-
-```bash
+npm create cloudflare@latest my-ws-proxy -- --template https://github.com/buoyant-systems/cloudflare-ws-proxy
+cd my-ws-proxy
+npx wrangler secret put BACKEND_SECRET    # enter a strong, random secret
 npm run deploy
 ```
 
-You'll receive a URL like `https://cloudflare-ws-proxy.<your-subdomain>.workers.dev`.
+You'll receive a URL like `https://cloudflare-ws-proxy.<your-subdomain>.workers.dev`. Done — you can delete the local directory if you want, the Worker lives in your Cloudflare account.
 
-### 4. Local development
+### One-click deploy (with CI/CD)
+
+If you want a GitHub repo with automatic deploys on every push:
+
+[![Deploy to Cloudflare Workers](https://deploy.workers.cloudflare.com/button)](https://deploy.workers.cloudflare.com/?url=https://github.com/buoyant-systems/cloudflare-ws-proxy)
+
+This forks the repo into your GitHub account and sets up a GitHub Actions workflow. You'll still need to set the secret afterward:
 
 ```bash
+npx wrangler secret put BACKEND_SECRET
+```
+
+### Local development
+
+```bash
+git clone https://github.com/buoyant-systems/cloudflare-ws-proxy.git
+cd cloudflare-ws-proxy
+npm install
+
 # Create a .dev.vars file with your secret for local dev
 echo 'BACKEND_SECRET=my-dev-secret' > .dev.vars
 
