@@ -16,13 +16,13 @@ Serverless platforms like Cloud Run charge for active container time and have re
 
 ```
 ┌──────────────┐    HTTP POST     ┌──────────────────┐   WebSocket    ┌─────────┐
-│   Backend    │ ───────────────→ │  cloudflare-ws-  │ ←───────────→ │ Browser │
+│   Backend    │ ───────────────→ │  cloudflare-ws-  │ ←───────────→  │ Browser │
 │ (Cloud Run)  │   (publish msg)  │      proxy       │  (hibernated)  │ Client  │
-└──────────────┘                  │  Durable Object  │               └─────────┘
+└──────────────┘                  │  Durable Object  │                └─────────┘
        │                          └──────────────────┘               ┌─────────┐
        │   short-lived HTTP              │                      ←──→ │ Browser │
-       └── connection closes             │   long-lived WS          │ Client  │
-           immediately                   │   connections held       └─────────┘
+       └── connection closes             │   long-lived WS           │ Client  │
+           immediately                   │   connections held        └─────────┘
                                          │   at zero cost
                                          │   during hibernation
 ```
