@@ -1,0 +1,35 @@
+{
+  "name": "Buoyant: cloudflare-ws-proxy",
+  "dockerComposeFile": "docker-compose.yaml",
+  "service": "cloudflare-ws-proxy",
+  "workspaceFolder": "/workspaces/cloudflare-ws-proxy",
+  "features": {
+    "ghcr.io/devcontainers/features/docker-outside-of-docker:1": {
+      "version": "latest",
+      "moby": "false",
+      "dockerDashComposeVersion": "none"
+    },
+    "ghcr.io/devcontainers/features/common-utils:2": {
+      "username": "vscode",
+      "upgradePackages": "false"
+    },
+    "ghcr.io/devcontainers/features/node:1": {},
+    "ghcr.io/rails/devcontainer/features/sqlite3:1": {}
+  },
+  "customizations": {
+    "antigravity": {
+      "settings": {
+        "antigravity.agent.dockerPath": "/usr/bin/docker"
+      },
+      "extensions": [
+        "golang.go"
+      ]
+    },
+    "vscode": {
+      "extensions": [
+        "golang.go"
+      ]
+    }
+  },
+  "postCreateCommand": "git config --global --add safe.directory /workspaces/cloudflare-ws-proxy"
+}

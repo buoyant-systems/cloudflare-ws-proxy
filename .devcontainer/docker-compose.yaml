@@ -1,0 +1,20 @@
+services:
+  cloudflare-ws-proxy:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    volumes:
+      - ../:/workspaces/cloudflare-ws-proxy:cached
+      # We map the host docker socket to a temporary location
+      - /var/run/docker.sock:/var/run/docker-host.sock
+    # Ensure host.docker.internal resolves on Linux (already works on macOS/Windows)
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    # Run as the developer user
+    user: vscode
+    # CRITICAL: This is the command that keeps the container running.
+    # It is passed as "$@" to our entrypoint script.
+    command: ["sleep", "infinity"]
+    dns:
+      - 8.8.8.8
+      - 1.1.1.1

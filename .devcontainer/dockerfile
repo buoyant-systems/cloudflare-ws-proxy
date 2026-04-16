@@ -1,0 +1,11 @@
+FROM mcr.microsoft.com/devcontainers/base:trixie
+
+# 1. Install 'socat' to fix the Agent connection pipe
+RUN apt-get update && apt-get install -y socat
+
+# 2. Bake our fix script into the image
+COPY entrypoint-fix.sh /usr/local/bin/init-antigravity.sh
+RUN chmod +x /usr/local/bin/init-antigravity.sh
+
+# 3. Set the script as the Entrypoint
+ENTRYPOINT ["/usr/local/bin/init-antigravity.sh"]
