@@ -62,6 +62,13 @@ export default {
     }
 
     // -----------------------------------------------------------------------
+    // Route: POST /bulk-publish
+    // -----------------------------------------------------------------------
+    if (method === "POST" && pathname === "/bulk-publish") {
+      return handleBulkPublish(request, env);
+    }
+
+    // -----------------------------------------------------------------------
     // Health check
     // -----------------------------------------------------------------------
     if (method === "GET" && (pathname === "/" || pathname === "/health")) {
@@ -155,6 +162,117 @@ async function handlePublish(
       headers: { "Content-Type": "application/json" },
       body: request.body,
     })
+  );
+}
+
+async function handleBulkPublish(
+  request: Request,
+  env: Env
+): Promise<Response> {
+  const authError = validateBackendAuth(request, env);
+  if (authError) return authError;
+
+  let body: {
+    messages?: Array<{
+      topic_id?: string;
+      message?: string;
+      encoding?: "text" | "base64";
+      ttl?: number;
+      max_buffer?: number;
+    }>;
+    ttl?: number;
+    max_buffer?: number;
+  };
+  try {
+    body = await request.json();
+  } catch {
+    return Response.json({ error: "Invalid JSON body" }, { status: 400 });
+  }
+
+  if (!Array.isArray(body.messages) || body.messages.length === 0) {
+    return Response.json(
+      { error: "Missing or empty 'messages' array" },
+      { status: 400 }
+    );
+  }
+
+  // Validate all messages and topic IDs upfront before any DO calls
+  for (let i = 0; i < body.messages.length; i++) {
+    const item = body.messages[i]!;
+    if (typeof item.topic_id !== "string" || item.topic_id.length === 0) {
+      return Response.json(
+        { error: `Invalid message at index ${i}: missing 'topic_id'` },
+        { status: 400 }
+      );
+    }
+    const idError = validateTopicId(item.topic_id);
+    if (idError) return idError;
+
+    if (typeof item.message !== "string") {
+      return Response.json(
+        { error: `Invalid message at index ${i}: missing 'message'` },
+        { status: 400 }
+      );
+    }
+  }
+
+  // Group messages by topic_id — one DO subrequest per unique topic
+  // Per-message ttl/max_buffer override top-level defaults; last value per topic wins
+  const topicGroups = new Map<
+    string,
+    {
+      messages: Array<{ message: string; encoding?: "text" | "base64" }>;
+      ttl?: number;
+      max_buffer?: number;
+    }
+  >();
+
+  for (const item of body.messages) {
+    const topicId = item.topic_id!;
+    let group = topicGroups.get(topicId);
+    if (!group) {
+      group = { messages: [], ttl: body.ttl, max_buffer: body.max_buffer };
+      topicGroups.set(topicId, group);
+    }
+    group.messages.push({
+      message: item.message!,
+      encoding: item.encoding,
+    });
+    // Per-message overrides — last one for this topic wins
+    if (item.ttl !== undefined) group.ttl = item.ttl;
+    if (item.max_buffer !== undefined) group.max_buffer = item.max_buffer;
+  }
+
+  // Fan out to DOs in parallel
+  const results = await Promise.all(
+    [...topicGroups.entries()].map(async ([topicId, group]) => {
+      const stub = getStub(env, topicId);
+      const doUrl = new URL(`https://do/topic/${topicId}/batch-publish`);
+      const response = await stub.fetch(
+        new Request(doUrl.toString(), {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            messages: group.messages,
+            ttl: group.ttl,
+            max_buffer: group.max_buffer,
+          }),
+        })
+      );
+
+      const result = await response.json<Record<string, unknown>>();
+      return { topic_id: topicId, status: response.status, ...result };
+    })
+  );
+
+  const allOk = results.every((r: { status: number }) => r.status === 200);
+  return Response.json(
+    {
+      topics: results.length,
+      messages: body.messages.length,
+      results,
+    },
+    { status: allOk ? 200 : 207 }
   );
 }
 

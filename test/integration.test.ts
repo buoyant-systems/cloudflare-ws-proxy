@@ -259,6 +259,149 @@ describe("Worker — GET /topic/:id/connect", () => {
 });
 
 // ---------------------------------------------------------------------------
+// Bulk publish endpoint
+// ---------------------------------------------------------------------------
+
+describe("Worker — POST /bulk-publish", () => {
+  it("rejects bulk publish without auth", async () => {
+    const response = await SELF.fetch("https://proxy/bulk-publish", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        messages: [{ topic_id: "test", message: "hello" }],
+      }),
+    });
+    expect(response.status).toBe(401);
+  });
+
+  it("rejects empty messages array", async () => {
+    const response = await SELF.fetch("https://proxy/bulk-publish", {
+      method: "POST",
+      headers: authHeaders(),
+      body: JSON.stringify({ messages: [] }),
+    });
+    expect(response.status).toBe(400);
+  });
+
+  it("rejects messages with missing topic_id", async () => {
+    const response = await SELF.fetch("https://proxy/bulk-publish", {
+      method: "POST",
+      headers: authHeaders(),
+      body: JSON.stringify({
+        messages: [{ message: "hello" }],
+      }),
+    });
+    expect(response.status).toBe(400);
+  });
+
+  it("rejects messages with missing message field", async () => {
+    const response = await SELF.fetch("https://proxy/bulk-publish", {
+      method: "POST",
+      headers: authHeaders(),
+      body: JSON.stringify({
+        messages: [{ topic_id: "test" }],
+      }),
+    });
+    expect(response.status).toBe(400);
+  });
+
+  it("publishes multiple messages to a single topic", async () => {
+    const topic = uniqueTopic("bulk-single");
+    const response = await SELF.fetch("https://proxy/bulk-publish", {
+      method: "POST",
+      headers: authHeaders(),
+      body: JSON.stringify({
+        messages: [
+          { topic_id: topic, message: "first" },
+          { topic_id: topic, message: "second" },
+          { topic_id: topic, message: "third" },
+        ],
+      }),
+    });
+    expect(response.status).toBe(200);
+
+    const body = await response.json<{
+      topics: number;
+      messages: number;
+      results: Array<{
+        topic_id: string;
+        messages_published: number;
+        first_seq: number;
+        last_seq: number;
+      }>;
+    }>();
+    expect(body.topics).toBe(1);
+    expect(body.messages).toBe(3);
+    expect(body.results).toHaveLength(1);
+    expect(body.results[0]!.topic_id).toBe(topic);
+    expect(body.results[0]!.messages_published).toBe(3);
+    expect(body.results[0]!.last_seq - body.results[0]!.first_seq).toBe(2);
+  });
+
+  it("publishes messages across multiple topics", async () => {
+    const topicA = uniqueTopic("bulk-a");
+    const topicB = uniqueTopic("bulk-b");
+    const response = await SELF.fetch("https://proxy/bulk-publish", {
+      method: "POST",
+      headers: authHeaders(),
+      body: JSON.stringify({
+        messages: [
+          { topic_id: topicA, message: "a1" },
+          { topic_id: topicB, message: "b1" },
+          { topic_id: topicA, message: "a2" },
+          { topic_id: topicB, message: "b2" },
+        ],
+      }),
+    });
+    expect(response.status).toBe(200);
+
+    const body = await response.json<{
+      topics: number;
+      messages: number;
+      results: Array<{
+        topic_id: string;
+        messages_published: number;
+      }>;
+    }>();
+    expect(body.topics).toBe(2);
+    expect(body.messages).toBe(4);
+
+    const resultA = body.results.find((r) => r.topic_id === topicA);
+    const resultB = body.results.find((r) => r.topic_id === topicB);
+    expect(resultA!.messages_published).toBe(2);
+    expect(resultB!.messages_published).toBe(2);
+  });
+
+  it("assigns incrementing sequence numbers within a batch", async () => {
+    const topic = uniqueTopic("bulk-seq");
+
+    // First, publish a single message to establish seq 0
+    await SELF.fetch(`https://proxy/topic/${topic}/publish`, {
+      method: "POST",
+      headers: authHeaders(),
+      body: JSON.stringify({ message: "seed" }),
+    });
+
+    // Then bulk publish — sequences should continue from 1
+    const response = await SELF.fetch("https://proxy/bulk-publish", {
+      method: "POST",
+      headers: authHeaders(),
+      body: JSON.stringify({
+        messages: [
+          { topic_id: topic, message: "batch1" },
+          { topic_id: topic, message: "batch2" },
+        ],
+      }),
+    });
+    const body = await response.json<{
+      results: Array<{ first_seq: number; last_seq: number }>;
+    }>();
+    expect(body.results[0]!.first_seq).toBe(1);
+    expect(body.results[0]!.last_seq).toBe(2);
+  });
+});
+
+// ---------------------------------------------------------------------------
 // 404 handling
 // ---------------------------------------------------------------------------
 

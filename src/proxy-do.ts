@@ -82,6 +82,9 @@ export class ProxyDO extends DurableObject<Env> {
     if (path.endsWith("/publish")) {
       return this.handlePublish(request);
     }
+    if (path.endsWith("/batch-publish")) {
+      return this.handleBatchPublish(request);
+    }
     if (path.endsWith("/delete")) {
       return this.handleDelete();
     }
@@ -201,6 +204,112 @@ export class ProxyDO extends DurableObject<Env> {
     return Response.json({
       seq,
       topic_id: extractTopicId(new URL(request.url)),
+      connections: sockets.length,
+    });
+  }
+
+  // -------------------------------------------------------------------------
+  // /batch-publish — Process multiple messages in a single request
+  // -------------------------------------------------------------------------
+
+  private async handleBatchPublish(request: Request): Promise<Response> {
+    let body: {
+      messages?: Array<{
+        message?: string;
+        encoding?: "text" | "base64";
+      }>;
+      ttl?: number;
+      max_buffer?: number;
+    };
+    try {
+      body = await request.json();
+    } catch {
+      return Response.json({ error: "Invalid JSON body" }, { status: 400 });
+    }
+
+    if (!Array.isArray(body.messages) || body.messages.length === 0) {
+      return Response.json(
+        { error: "Missing or empty 'messages' array" },
+        { status: 400 }
+      );
+    }
+
+    // Validate all messages before processing any
+    for (let i = 0; i < body.messages.length; i++) {
+      if (typeof body.messages[i]!.message !== "string") {
+        return Response.json(
+          { error: `Invalid message at index ${i}: missing or invalid 'message' field` },
+          { status: 400 }
+        );
+      }
+    }
+
+    const ttlMs = (body.ttl ?? DEFAULT_MESSAGE_TTL_MS / 1000) * 1000;
+    const maxBuffer = body.max_buffer ?? DEFAULT_MAX_BUFFER_SIZE;
+
+    // Load metadata once for the entire batch
+    const meta = await this.getMeta();
+    meta.messageTtlMs = ttlMs;
+    meta.maxBufferSize = maxBuffer;
+
+    const now = Date.now();
+    const storedMessages: StoredMessage[] = [];
+    const storageEntries: Record<string, StoredMessage> = {};
+
+    // Assign sequence numbers and prepare storage entries
+    for (const item of body.messages) {
+      const seq = meta.nextSeq;
+      meta.nextSeq = seq + 1;
+
+      const stored: StoredMessage = {
+        seq,
+        data: item.message!,
+        encoding: item.encoding === "base64" ? "base64" : "text",
+        timestamp: now,
+      };
+
+      storedMessages.push(stored);
+      storageEntries[`msg:${seq}`] = stored;
+    }
+
+    // Batch write all messages at once
+    await this.ctx.storage.put(storageEntries);
+
+    // Prune once after all messages are stored (mutates meta.oldestSeq)
+    await this.pruneBuffer(meta);
+
+    // Save metadata once
+    await this.ctx.storage.put("meta", meta);
+
+    // Set alarm once if needed
+    const existingAlarm = await this.ctx.storage.getAlarm();
+    if (existingAlarm === null) {
+      await this.ctx.storage.setAlarm(now + ttlMs);
+    }
+
+    // Broadcast all messages to connected WebSockets
+    const sockets = this.ctx.getWebSockets();
+    for (const msg of storedMessages) {
+      const envelope = JSON.stringify({
+        seq: msg.seq,
+        data: msg.data,
+        encoding: msg.encoding,
+        timestamp: msg.timestamp,
+      });
+      for (const ws of sockets) {
+        try {
+          ws.send(envelope);
+        } catch {
+          // Socket may have died — will be cleaned up on close event
+        }
+      }
+    }
+
+    return Response.json({
+      topic_id: extractTopicId(new URL(request.url)),
+      messages_published: storedMessages.length,
+      first_seq: storedMessages[0]!.seq,
+      last_seq: storedMessages[storedMessages.length - 1]!.seq,
       connections: sockets.length,
     });
   }
