@@ -3,23 +3,21 @@
   "name": "cloudflare-ws-proxy",
   "main": "src/index.ts",
   "compatibility_date": "2026-04-16",
-  "compatibility_flags": ["nodejs_compat"],
-
+  "compatibility_flags": [
+    "nodejs_compat"
+  ],
   // CPU safety net — shared between Worker and DOs. The Worker is a thin
   // routing layer (~1-2ms), but DO broadcast (batch × sockets) can reach
   // ~15-20ms on large fan-outs. 30ms gives safe headroom for both.
   "limits": {
     "cpu_ms": 30
   },
-
   // Route Worker close to the DO, not the client edge
   "placement": {
     "mode": "smart"
   },
-
   // No need for preview URLs on a backend proxy
   "preview_urls": false,
-
   // Durable Object binding — the ProxyDO class handles WebSocket hibernation
   "durable_objects": {
     "bindings": [
@@ -29,15 +27,15 @@
       }
     ]
   },
-
   // SQLite-backed storage (modern default, more efficient than legacy KV)
   "migrations": [
     {
       "tag": "v1",
-      "new_sqlite_classes": ["ProxyDO"]
+      "new_sqlite_classes": [
+        "ProxyDO"
+      ]
     }
   ],
-
   // Disabled by default to avoid per-event billing on high-throughput workloads.
   // Enable when debugging: wrangler deploy picks up changes immediately.
   "observability": {
