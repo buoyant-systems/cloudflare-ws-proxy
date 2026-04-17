@@ -49,10 +49,26 @@ const DEFAULT_MESSAGE_TTL_MS = 3600 * 1000; // 1 hour
 
 export class ProxyDO extends DurableObject<Env> {
   private sessions: Map<WebSocket, SessionAttachment>;
+  private meta: TopicMeta | null = null;
+  private alarmScheduled: boolean | null = null;
 
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env);
     this.sessions = new Map();
+
+    // Load cached state once per DO wake-up, before any requests are processed.
+    // This eliminates per-request storage reads for meta and alarm state.
+    ctx.blockConcurrencyWhile(async () => {
+      const stored = await ctx.storage.get<TopicMeta>("meta");
+      this.meta = stored ?? {
+        nextSeq: 0,
+        oldestSeq: 0,
+        maxBufferSize: DEFAULT_MAX_BUFFER_SIZE,
+        messageTtlMs: DEFAULT_MESSAGE_TTL_MS,
+      };
+      const alarm = await ctx.storage.getAlarm();
+      this.alarmScheduled = alarm !== null;
+    });
 
     // Restore sessions from hibernated WebSockets
     for (const ws of this.ctx.getWebSockets()) {
@@ -169,20 +185,20 @@ export class ProxyDO extends DurableObject<Env> {
       timestamp: Date.now(),
     };
 
-    // Store the message
-    await this.ctx.storage.put(`msg:${seq}`, storedMessage);
+    // Compute prune keys before writing (mutates meta.oldestSeq)
+    const pruneKeys = this.computePruneKeys(meta);
 
-    // Prune oldest messages if buffer exceeds max (mutates meta.oldestSeq)
-    await this.pruneBuffer(meta);
-
-    // Save metadata after pruning (oldestSeq may have changed)
-    await this.ctx.storage.put("meta", meta);
-
-    // Set alarm for TTL-based cleanup — only if none is pending
-    const existingAlarm = await this.ctx.storage.getAlarm();
-    if (existingAlarm === null) {
-      await this.ctx.storage.setAlarm(Date.now() + ttlMs);
+    // Coalesce message + metadata into a single storage write
+    await this.ctx.storage.put({
+      [`msg:${seq}`]: storedMessage,
+      "meta": meta,
+    });
+    if (pruneKeys.length > 0) {
+      await this.ctx.storage.delete(pruneKeys);
     }
+
+    // Set alarm for TTL-based cleanup — only if none is pending (cached)
+    await this.ensureAlarm(ttlMs);
 
     // Broadcast to all connected WebSockets
     const envelope = JSON.stringify({
@@ -272,20 +288,18 @@ export class ProxyDO extends DurableObject<Env> {
       storageEntries[`msg:${seq}`] = stored;
     }
 
-    // Batch write all messages at once
+    // Compute prune keys before writing (mutates meta.oldestSeq)
+    const pruneKeys = this.computePruneKeys(meta);
+
+    // Coalesce all messages + metadata into a single storage write
+    (storageEntries as Record<string, unknown>)["meta"] = meta;
     await this.ctx.storage.put(storageEntries);
-
-    // Prune once after all messages are stored (mutates meta.oldestSeq)
-    await this.pruneBuffer(meta);
-
-    // Save metadata once
-    await this.ctx.storage.put("meta", meta);
-
-    // Set alarm once if needed
-    const existingAlarm = await this.ctx.storage.getAlarm();
-    if (existingAlarm === null) {
-      await this.ctx.storage.setAlarm(now + ttlMs);
+    if (pruneKeys.length > 0) {
+      await this.ctx.storage.delete(pruneKeys);
     }
+
+    // Set alarm once if needed (cached)
+    await this.ensureAlarm(ttlMs);
 
     // Broadcast all messages to connected WebSockets
     const sockets = this.ctx.getWebSockets();
@@ -332,6 +346,8 @@ export class ProxyDO extends DurableObject<Env> {
 
     this.sessions.clear();
     await this.ctx.storage.deleteAll();
+    this.meta = null;
+    this.alarmScheduled = false;
 
     return Response.json({ deleted: true, connections_closed: count });
   }
@@ -369,21 +385,29 @@ export class ProxyDO extends DurableObject<Env> {
     const now = Date.now();
     const cutoff = now - meta.messageTtlMs;
 
-    // Walk sequentially from oldest — messages are ordered by time
+    // Batch-read all remaining messages in a single storage operation
+    const allKeys: string[] = [];
+    for (let seq = meta.oldestSeq; seq < meta.nextSeq; seq++) {
+      allKeys.push(`msg:${seq}`);
+    }
+
     const keysToDelete: string[] = [];
     let firstSurvivorTimestamp: number | null = null;
 
-    for (let seq = meta.oldestSeq; seq < meta.nextSeq; seq++) {
-      const msg = await this.ctx.storage.get<StoredMessage>(`msg:${seq}`);
-      if (!msg) {
-        // Gap — already deleted (e.g. by pruneBuffer), skip
-        continue;
-      }
-      if (msg.timestamp <= cutoff) {
-        keysToDelete.push(`msg:${seq}`);
-      } else {
-        firstSurvivorTimestamp = msg.timestamp;
-        break; // messages are sequential in time — no more expired
+    if (allKeys.length > 0) {
+      const messages = await this.ctx.storage.get<StoredMessage>(allKeys);
+      for (let seq = meta.oldestSeq; seq < meta.nextSeq; seq++) {
+        const msg = messages.get(`msg:${seq}`);
+        if (!msg) {
+          // Gap — already deleted (e.g. by pruneBuffer), skip
+          continue;
+        }
+        if (msg.timestamp <= cutoff) {
+          keysToDelete.push(`msg:${seq}`);
+        } else {
+          firstSurvivorTimestamp = msg.timestamp;
+          break; // messages are sequential in time — no more expired
+        }
       }
     }
 
@@ -399,12 +423,23 @@ export class ProxyDO extends DurableObject<Env> {
       // Reschedule alarm for the next message expiry
       const nextAlarmTime = firstSurvivorTimestamp + meta.messageTtlMs;
       await this.ctx.storage.setAlarm(Math.max(nextAlarmTime, now + 1000));
-    } else if (remaining <= 0) {
-      // No messages left — if no connections, full cleanup for zero-cost state
+      this.alarmScheduled = true;
+    } else {
+      this.alarmScheduled = false;
+      // No messages left — the server hasn't published anything with a later
+      // TTL, so this topic is dead. Close all connections and wipe storage
+      // for zero-cost state. The server dictates topic lifecycle.
       const sockets = this.ctx.getWebSockets();
-      if (sockets.length === 0) {
-        await this.ctx.storage.deleteAll();
+      for (const ws of sockets) {
+        try {
+          ws.close(1000, "topic expired");
+        } catch {
+          // Ignore errors on already-closed sockets
+        }
       }
+      this.sessions.clear();
+      await this.ctx.storage.deleteAll();
+      this.meta = null;
     }
   }
 
@@ -413,35 +448,54 @@ export class ProxyDO extends DurableObject<Env> {
   // -------------------------------------------------------------------------
 
   private async getMeta(): Promise<TopicMeta> {
-    const meta = await this.ctx.storage.get<TopicMeta>("meta");
-    return (
-      meta ?? {
-        nextSeq: 0,
-        oldestSeq: 0,
-        maxBufferSize: DEFAULT_MAX_BUFFER_SIZE,
-        messageTtlMs: DEFAULT_MESSAGE_TTL_MS,
-      }
-    );
+    if (this.meta) return this.meta;
+    // Fallback — should not normally be reached due to blockConcurrencyWhile
+    const stored = await this.ctx.storage.get<TopicMeta>("meta");
+    this.meta = stored ?? {
+      nextSeq: 0,
+      oldestSeq: 0,
+      maxBufferSize: DEFAULT_MAX_BUFFER_SIZE,
+      messageTtlMs: DEFAULT_MESSAGE_TTL_MS,
+    };
+    return this.meta;
   }
 
-  private async pruneBuffer(meta: TopicMeta): Promise<void> {
+  /**
+   * Compute which message keys should be pruned to stay within maxBufferSize.
+   * Pure arithmetic — no I/O. Mutates meta.oldestSeq.
+   */
+  private computePruneKeys(meta: TopicMeta): string[] {
     const count = meta.nextSeq - meta.oldestSeq;
     if (count <= meta.maxBufferSize) {
-      return; // No scan needed — simple arithmetic check
+      return []; // No pruning needed — simple arithmetic check
     }
 
-    // Calculate which sequences to delete and batch-delete them
     const newOldest = meta.nextSeq - meta.maxBufferSize;
-    const keysToDelete: string[] = [];
+    const keys: string[] = [];
     for (let seq = meta.oldestSeq; seq < newOldest; seq++) {
-      keysToDelete.push(`msg:${seq}`);
-    }
-
-    if (keysToDelete.length > 0) {
-      await this.ctx.storage.delete(keysToDelete);
+      keys.push(`msg:${seq}`);
     }
 
     meta.oldestSeq = newOldest;
+    return keys;
+  }
+
+  /**
+   * Ensure a TTL alarm is scheduled, using cached state to avoid redundant
+   * storage reads after the first check per DO lifetime.
+   */
+  private async ensureAlarm(ttlMs: number): Promise<void> {
+    if (this.alarmScheduled === true) return;
+    if (this.alarmScheduled === null) {
+      // Unknown state — check storage once
+      const existing = await this.ctx.storage.getAlarm();
+      if (existing !== null) {
+        this.alarmScheduled = true;
+        return;
+      }
+    }
+    await this.ctx.storage.setAlarm(Date.now() + ttlMs);
+    this.alarmScheduled = true;
   }
 
   private async replayMessages(ws: WebSocket, cursor: number): Promise<void> {
@@ -449,8 +503,16 @@ export class ProxyDO extends DurableObject<Env> {
     // Start from the cursor or the oldest available message, whichever is later
     const start = Math.max(cursor, meta.oldestSeq);
 
+    // Batch-read all replay keys in a single storage operation
+    const keys: string[] = [];
     for (let seq = start; seq < meta.nextSeq; seq++) {
-      const msg = await this.ctx.storage.get<StoredMessage>(`msg:${seq}`);
+      keys.push(`msg:${seq}`);
+    }
+    if (keys.length === 0) return;
+
+    const messages = await this.ctx.storage.get<StoredMessage>(keys);
+    for (let seq = start; seq < meta.nextSeq; seq++) {
+      const msg = messages.get(`msg:${seq}`);
       if (!msg) continue; // gap from TTL expiry
       try {
         ws.send(
