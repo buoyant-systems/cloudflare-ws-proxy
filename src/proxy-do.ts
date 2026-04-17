@@ -26,9 +26,13 @@ interface StoredMessage {
 }
 
 interface TopicMeta {
+  /** Random ID created once per topic lifecycle — changes on delete/expire+recreate */
+  generation: string;
   nextSeq: number;
   oldestSeq: number;
+  /** Set on first publish, immutable for the topic's lifetime */
   maxBufferSize: number;
+  /** Set on first publish, immutable for the topic's lifetime */
   messageTtlMs: number;
 }
 
@@ -61,6 +65,7 @@ export class ProxyDO extends DurableObject<Env> {
     ctx.blockConcurrencyWhile(async () => {
       const stored = await ctx.storage.get<TopicMeta>("meta");
       this.meta = stored ?? {
+        generation: "",
         nextSeq: 0,
         oldestSeq: 0,
         maxBufferSize: DEFAULT_MAX_BUFFER_SIZE,
@@ -167,13 +172,16 @@ export class ProxyDO extends DurableObject<Env> {
     }
 
     const encoding = body.encoding === "base64" ? "base64" : "text";
-    const ttlMs = (body.ttl ?? DEFAULT_MESSAGE_TTL_MS / 1000) * 1000;
-    const maxBuffer = body.max_buffer ?? DEFAULT_MAX_BUFFER_SIZE;
 
     // Load or initialize metadata
     const meta = await this.getMeta();
-    meta.messageTtlMs = ttlMs;
-    meta.maxBufferSize = maxBuffer;
+
+    // Topic config is set once on first publish, immutable after
+    if (meta.generation === "") {
+      meta.generation = crypto.randomUUID();
+      meta.messageTtlMs = (body.ttl ?? DEFAULT_MESSAGE_TTL_MS / 1000) * 1000;
+      meta.maxBufferSize = body.max_buffer ?? DEFAULT_MAX_BUFFER_SIZE;
+    }
 
     const seq = meta.nextSeq;
     meta.nextSeq = seq + 1;
@@ -198,10 +206,11 @@ export class ProxyDO extends DurableObject<Env> {
     }
 
     // Set alarm for TTL-based cleanup — only if none is pending (cached)
-    await this.ensureAlarm(ttlMs);
+    await this.ensureAlarm(meta.messageTtlMs);
 
     // Broadcast to all connected WebSockets
     const envelope = JSON.stringify({
+      generation: meta.generation,
       seq: storedMessage.seq,
       data: storedMessage.data,
       encoding: storedMessage.encoding,
@@ -220,6 +229,7 @@ export class ProxyDO extends DurableObject<Env> {
     return Response.json({
       seq,
       topic_id: extractTopicId(new URL(request.url)),
+      generation: meta.generation,
       connections: sockets.length,
     });
   }
@@ -260,13 +270,15 @@ export class ProxyDO extends DurableObject<Env> {
       }
     }
 
-    const ttlMs = (body.ttl ?? DEFAULT_MESSAGE_TTL_MS / 1000) * 1000;
-    const maxBuffer = body.max_buffer ?? DEFAULT_MAX_BUFFER_SIZE;
-
     // Load metadata once for the entire batch
     const meta = await this.getMeta();
-    meta.messageTtlMs = ttlMs;
-    meta.maxBufferSize = maxBuffer;
+
+    // Topic config is set once on first publish, immutable after
+    if (meta.generation === "") {
+      meta.generation = crypto.randomUUID();
+      meta.messageTtlMs = (body.ttl ?? DEFAULT_MESSAGE_TTL_MS / 1000) * 1000;
+      meta.maxBufferSize = body.max_buffer ?? DEFAULT_MAX_BUFFER_SIZE;
+    }
 
     const now = Date.now();
     const storedMessages: StoredMessage[] = [];
@@ -299,12 +311,13 @@ export class ProxyDO extends DurableObject<Env> {
     }
 
     // Set alarm once if needed (cached)
-    await this.ensureAlarm(ttlMs);
+    await this.ensureAlarm(meta.messageTtlMs);
 
     // Broadcast all messages to connected WebSockets
     const sockets = this.ctx.getWebSockets();
     for (const msg of storedMessages) {
       const envelope = JSON.stringify({
+        generation: meta.generation,
         seq: msg.seq,
         data: msg.data,
         encoding: msg.encoding,
@@ -321,6 +334,7 @@ export class ProxyDO extends DurableObject<Env> {
 
     return Response.json({
       topic_id: extractTopicId(new URL(request.url)),
+      generation: meta.generation,
       messages_published: storedMessages.length,
       first_seq: storedMessages[0]!.seq,
       last_seq: storedMessages[storedMessages.length - 1]!.seq,
@@ -452,6 +466,7 @@ export class ProxyDO extends DurableObject<Env> {
     // Fallback — should not normally be reached due to blockConcurrencyWhile
     const stored = await this.ctx.storage.get<TopicMeta>("meta");
     this.meta = stored ?? {
+      generation: "",
       nextSeq: 0,
       oldestSeq: 0,
       maxBufferSize: DEFAULT_MAX_BUFFER_SIZE,
@@ -517,6 +532,7 @@ export class ProxyDO extends DurableObject<Env> {
       try {
         ws.send(
           JSON.stringify({
+            generation: meta.generation,
             seq: msg.seq,
             data: msg.data,
             encoding: msg.encoding,
