@@ -132,17 +132,27 @@ POST /topic/:id/publish
 |-------|------|---------|-------------|
 | `message` | string | _required_ | The message payload. For binary data, base64-encode it and set `encoding: "base64"` |
 | `encoding` | string | `"text"` | Set to `"base64"` if `message` contains base64-encoded binary data |
-| `ttl` | number | `3600` (1 hour) | Message time-to-live in seconds. After this, messages are automatically cleaned up |
-| `max_buffer` | number | `100` | Maximum number of messages to buffer. Oldest messages are pruned when exceeded |
+| `ttl` | number | `3600` (1 hour) | Message time-to-live in seconds. **Set on first publish; ignored on subsequent publishes** |
+| `max_buffer` | number | `100` | Maximum number of messages to buffer. **Set on first publish; ignored on subsequent publishes** |
+
+> **Note:** `ttl` and `max_buffer` are locked when the topic is created (first publish). Subsequent publishes to the same topic use the original values. To change them, delete the topic and recreate it.
 
 **Response:**
 ```json
 {
   "seq": 42,
   "topic_id": "my-topic",
+  "generation": "a1b2c3d4-e5f6-7890-abcd-ef1234567890",
   "connections": 5
 }
 ```
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `seq` | number | Sequence number assigned to this message (monotonically increasing, resets on topic teardown) |
+| `topic_id` | string | The topic ID |
+| `generation` | string | Unique ID for this topic lifecycle. Changes when the topic is deleted or expires and is recreated. Clients can compare this to detect stale cursors |
+| `connections` | number | Number of currently connected WebSocket clients |
 
 **Example:**
 ```bash
@@ -175,7 +185,7 @@ POST /bulk-publish
   "messages": [
     { "topic_id": "chat.room.1", "message": "{\"text\": \"hello\"}" },
     { "topic_id": "chat.room.1", "message": "{\"text\": \"world\"}" },
-    { "topic_id": "chat.room.2", "message": "{\"text\": \"foo\"}", "ttl": 60, "max_buffer": 10 },
+    { "topic_id": "chat.room.2", "message": "{\"text\": \"foo\"}" },
     { "topic_id": "chat.room.2", "message": "SGVsbG8=", "encoding": "base64" }
   ],
   "ttl": 3600,
@@ -189,10 +199,8 @@ POST /bulk-publish
 | `messages[].topic_id` | string | _required_ | Target topic for this message |
 | `messages[].message` | string | _required_ | The message payload |
 | `messages[].encoding` | string | `"text"` | Set to `"base64"` for binary data |
-| `messages[].ttl` | number | _top-level default_ | Per-topic TTL override (last value per topic wins) |
-| `messages[].max_buffer` | number | _top-level default_ | Per-topic buffer size override (last value per topic wins) |
-| `ttl` | number | `3600` (1 hour) | Default TTL for topics that don't specify one per-message |
-| `max_buffer` | number | `100` | Default buffer size for topics that don't specify one per-message |
+| `ttl` | number | `3600` (1 hour) | TTL in seconds. **Only used when creating a new topic; ignored for existing topics** |
+| `max_buffer` | number | `100` | Buffer size. **Only used when creating a new topic; ignored for existing topics** |
 
 **Response:**
 ```json
@@ -202,6 +210,7 @@ POST /bulk-publish
   "results": [
     {
       "topic_id": "chat.room.1",
+      "generation": "a1b2c3d4-e5f6-7890-abcd-ef1234567890",
       "status": 200,
       "messages_published": 2,
       "first_seq": 0,
@@ -210,6 +219,7 @@ POST /bulk-publish
     },
     {
       "topic_id": "chat.room.2",
+      "generation": "f7e8d9c0-b1a2-3456-fedc-ba0987654321",
       "status": 200,
       "messages_published": 2,
       "first_seq": 0,
@@ -262,11 +272,19 @@ const url = "wss://your-worker.workers.dev/topic/my-topic/connect?token=abc123";
 const ws = new WebSocket(url);
 
 let lastSeq = 0;
+let generation = null;
 
 ws.onmessage = (event) => {
   const msg = JSON.parse(event.data);
-  // msg = { seq: 42, data: "hello world", timestamp: 1713234567890 }
-  // or for binary: { seq: 43, data: "SGVsbG8=", encoding: "base64", timestamp: ... }
+  // msg = { generation: "...", seq: 42, data: "hello world", timestamp: 1713234567890 }
+  // or for binary: { generation: "...", seq: 43, data: "SGVsbG8=", encoding: "base64", timestamp: ... }
+
+  // Detect topic recycling — generation changes when topic is deleted/expired
+  if (generation && msg.generation !== generation) {
+    console.warn("Topic was recycled — cursor is stale, resetting");
+    lastSeq = 0;
+  }
+  generation = msg.generation;
   lastSeq = msg.seq;
   console.log("Received:", msg.data);
 };
@@ -280,6 +298,7 @@ ws.onclose = () => {
 **Message envelope:**
 ```json
 {
+  "generation": "a1b2c3d4-e5f6-7890-abcd-ef1234567890",
   "seq": 42,
   "data": "the message payload",
   "encoding": "text",
@@ -291,7 +310,7 @@ ws.onclose = () => {
 
 ### Delete Topic
 
-Force-closes all WebSocket connections and wipes all buffered messages for a topic. Use this for immediate teardown (e.g. live stream ended, room closed for moderation).
+Force-closes all WebSocket connections and wipes all buffered messages for a topic. Use this for immediate teardown (e.g. live stream ended, room closed for moderation). The next publish to this topic starts a new lifecycle with a fresh `generation` and sequence numbers from 0.
 
 ```
 DELETE /topic/:id
@@ -334,6 +353,18 @@ Topic IDs must match: `^[a-zA-Z0-9_.:~-]{1,128}$`
 
 Durable Object hibernation means you only pay for the brief moments when messages are actually being processed and broadcast. Between messages, the DO sleeps while Cloudflare's edge infrastructure keeps the WebSocket connections alive for free.
 
+## Topic Lifecycle
+
+Each topic has a **static configuration** that is locked on creation (first publish):
+
+- **TTL** — how long messages live before automatic cleanup
+- **Buffer size** — maximum number of messages to retain (oldest are pruned when exceeded)
+- **Generation** — a unique UUID identifying this topic lifecycle
+
+When a topic is torn down (via `DELETE` or when all messages expire via TTL), its storage is fully wiped. The next publish creates a **new lifecycle** with a fresh generation, new config, and sequence numbers starting from 0.
+
+Clients can detect topic recycling by comparing the `generation` field in message envelopes. A generation change means the cursor is stale and should be discarded.
+
 ## Configuration
 
 | Environment Variable | Required | Description |
@@ -344,11 +375,11 @@ Durable Object hibernation means you only pay for the brief moments when message
 
 | Setting | Default | Configurable Via |
 |---------|---------|-----------------|
-| Message buffer size | 100 messages | `max_buffer` field on publish |
-| Message TTL | 1 hour (3600s) | `ttl` field on publish |
+| Message buffer size | 100 messages | `max_buffer` field on first publish |
+| Message TTL | 1 hour (3600s) | `ttl` field on first publish |
 | Auth token TTL | 5 minutes (300s) | `token_ttl_seconds` field on auth |
 
-Limits are set per-topic and can be changed on every publish call. The latest values are persisted.
+> **Note:** `ttl` and `max_buffer` are set once per topic lifecycle (on the first publish). To change them, delete the topic and let the next publish create a new lifecycle with the desired values.
 
 ## Architecture
 

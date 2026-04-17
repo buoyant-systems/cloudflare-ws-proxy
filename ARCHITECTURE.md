@@ -85,5 +85,8 @@ stateDiagram-v2
 
     Active --> Destroyed: DELETE /topic/:id
     Hibernating --> Active: Alarm fires (TTL cleanup)
+    Active --> Destroyed: Alarm fires (all messages expired)
     Destroyed --> [*]: Storage wiped, sockets closed
 ```
+
+> **Topic lifecycle:** Each topic's TTL, buffer size, and generation UUID are set once on creation (first publish) and immutable for the topic's lifetime. When a topic is torn down — either by explicit `DELETE` or when all messages expire via TTL — its storage is fully wiped and connections are closed. The next publish creates a new lifecycle with a fresh generation.
