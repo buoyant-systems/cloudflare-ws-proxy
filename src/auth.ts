@@ -124,7 +124,7 @@ export async function verifyToken(
     const payload: TokenPayload = JSON.parse(decoder.decode(payloadBytes));
 
     // Check expiry
-    if (payload.exp < Date.now()) {
+    if (payload.exp <= Date.now()) {
       return null;
     }
 
