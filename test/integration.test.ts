@@ -15,9 +15,12 @@ function authHeaders(): HeadersInit {
   };
 }
 
-/** Generate a unique topic ID per test to avoid cross-contamination (isolated storage is off). */
-function uniqueTopic(prefix: string): string {
-  return `${prefix}-${crypto.randomUUID().slice(0, 8)}`;
+/** Generate a unique topic ID (shard/topic) per test to avoid cross-contamination. */
+function uniqueTopic(prefix: string): { shard: string; topic: string; fullId: string } {
+  const uid = crypto.randomUUID().slice(0, 8);
+  const shard = `${prefix}-${uid}`;
+  const topic = "t";
+  return { shard, topic, fullId: `${shard}/${topic}` };
 }
 
 // ---------------------------------------------------------------------------
@@ -40,16 +43,16 @@ describe("Worker — health check", () => {
 
 describe("Worker — backend auth", () => {
   it("rejects requests without Authorization header", async () => {
-    const topic = uniqueTopic("auth-noheader");
-    const response = await SELF.fetch(`https://proxy/topic/${topic}/auth`, {
+    const { shard, topic } = uniqueTopic("auth-noheader");
+    const response = await SELF.fetch(`https://proxy/t/${shard}/${topic}/auth`, {
       method: "POST",
     });
     expect(response.status).toBe(401);
   });
 
   it("rejects requests with wrong secret", async () => {
-    const topic = uniqueTopic("auth-wrong");
-    const response = await SELF.fetch(`https://proxy/topic/${topic}/auth`, {
+    const { shard, topic } = uniqueTopic("auth-wrong");
+    const response = await SELF.fetch(`https://proxy/t/${shard}/${topic}/auth`, {
       method: "POST",
       headers: { Authorization: "Bearer wrong-secret" },
     });
@@ -62,35 +65,35 @@ describe("Worker — backend auth", () => {
 // ---------------------------------------------------------------------------
 
 describe("Worker — topic ID validation", () => {
-  it("rejects topic IDs with invalid characters", async () => {
-    const response = await SELF.fetch("https://proxy/topic/bad%20id/auth", {
+  it("rejects shard keys with invalid characters", async () => {
+    const response = await SELF.fetch("https://proxy/t/bad%20id/topic/auth", {
       method: "POST",
       headers: authHeaders(),
     });
     expect(response.status).toBe(400);
   });
 
-  it("rejects topic IDs longer than 128 characters", async () => {
+  it("rejects shard keys longer than 128 characters", async () => {
     const longId = "a".repeat(129);
-    const response = await SELF.fetch(`https://proxy/topic/${longId}/auth`, {
+    const response = await SELF.fetch(`https://proxy/t/${longId}/topic/auth`, {
       method: "POST",
       headers: authHeaders(),
     });
     expect(response.status).toBe(400);
   });
 
-  it("accepts valid topic IDs", async () => {
-    const topic = uniqueTopic("valid-Topic_123");
-    const response = await SELF.fetch(`https://proxy/topic/${topic}/auth`, {
+  it("accepts valid shard/topic IDs", async () => {
+    const { shard, topic } = uniqueTopic("valid-Topic_123");
+    const response = await SELF.fetch(`https://proxy/t/${shard}/${topic}/auth`, {
       method: "POST",
       headers: authHeaders(),
     });
     expect(response.status).toBe(200);
   });
 
-  it("accepts topic IDs with dots, colons, and tildes", async () => {
-    for (const topic of ["user:123", "chat.room.5", "org~team"]) {
-      const response = await SELF.fetch(`https://proxy/topic/${topic}/auth`, {
+  it("accepts shard keys with dots, colons, and tildes", async () => {
+    for (const shard of ["user:123", "chat.room.5", "org~team"]) {
+      const response = await SELF.fetch(`https://proxy/t/${shard}/default/auth`, {
         method: "POST",
         headers: authHeaders(),
       });
@@ -103,10 +106,10 @@ describe("Worker — topic ID validation", () => {
 // Auth endpoint
 // ---------------------------------------------------------------------------
 
-describe("Worker — POST /topic/:id/auth", () => {
+describe("Worker — POST /t/:shard/:topic/auth", () => {
   it("returns a WebSocket URL with a signed token", async () => {
-    const topic = uniqueTopic("auth-url");
-    const response = await SELF.fetch(`https://proxy/topic/${topic}/auth`, {
+    const { shard, topic, fullId } = uniqueTopic("auth-url");
+    const response = await SELF.fetch(`https://proxy/t/${shard}/${topic}/auth`, {
       method: "POST",
       headers: authHeaders(),
     });
@@ -117,14 +120,14 @@ describe("Worker — POST /topic/:id/auth", () => {
       topic_id: string;
       expires_at: number;
     }>();
-    expect(body.topic_id).toBe(topic);
-    expect(body.url).toContain(`/topic/${topic}/connect?token=`);
+    expect(body.topic_id).toBe(fullId);
+    expect(body.url).toContain(`/t/${shard}/${topic}/connect?token=`);
     expect(body.expires_at).toBeGreaterThan(Date.now());
   });
 
   it("respects custom token_ttl_seconds", async () => {
-    const topic = uniqueTopic("auth-ttl");
-    const response = await SELF.fetch(`https://proxy/topic/${topic}/auth`, {
+    const { shard, topic } = uniqueTopic("auth-ttl");
+    const response = await SELF.fetch(`https://proxy/t/${shard}/${topic}/auth`, {
       method: "POST",
       headers: authHeaders(),
       body: JSON.stringify({ token_ttl_seconds: 60 }),
@@ -140,10 +143,10 @@ describe("Worker — POST /topic/:id/auth", () => {
 // Publish endpoint
 // ---------------------------------------------------------------------------
 
-describe("Worker — POST /topic/:id/publish", () => {
+describe("Worker — POST /t/:shard/:topic/publish", () => {
   it("publishes a text message and returns a sequence number", async () => {
-    const topic = uniqueTopic("pub-text");
-    const response = await SELF.fetch(`https://proxy/topic/${topic}/publish`, {
+    const { shard, topic, fullId } = uniqueTopic("pub-text");
+    const response = await SELF.fetch(`https://proxy/t/${shard}/${topic}/publish`, {
       method: "POST",
       headers: authHeaders(),
       body: JSON.stringify({ message: "hello" }),
@@ -156,13 +159,13 @@ describe("Worker — POST /topic/:id/publish", () => {
       connections: number;
     }>();
     expect(body.seq).toBeGreaterThanOrEqual(0);
-    expect(body.topic_id).toBe(topic);
+    expect(body.topic_id).toBe(fullId);
     expect(typeof body.connections).toBe("number");
   });
 
   it("publishes a base64-encoded message", async () => {
-    const topic = uniqueTopic("pub-b64");
-    const response = await SELF.fetch(`https://proxy/topic/${topic}/publish`, {
+    const { shard, topic } = uniqueTopic("pub-b64");
+    const response = await SELF.fetch(`https://proxy/t/${shard}/${topic}/publish`, {
       method: "POST",
       headers: authHeaders(),
       body: JSON.stringify({
@@ -174,8 +177,8 @@ describe("Worker — POST /topic/:id/publish", () => {
   });
 
   it("rejects publish without a message field", async () => {
-    const topic = uniqueTopic("pub-nomsg");
-    const response = await SELF.fetch(`https://proxy/topic/${topic}/publish`, {
+    const { shard, topic } = uniqueTopic("pub-nomsg");
+    const response = await SELF.fetch(`https://proxy/t/${shard}/${topic}/publish`, {
       method: "POST",
       headers: authHeaders(),
       body: JSON.stringify({}),
@@ -184,16 +187,16 @@ describe("Worker — POST /topic/:id/publish", () => {
   });
 
   it("returns incrementing sequence numbers", async () => {
-    const topic = uniqueTopic("pub-seq");
+    const { shard, topic } = uniqueTopic("pub-seq");
 
-    const r1 = await SELF.fetch(`https://proxy/topic/${topic}/publish`, {
+    const r1 = await SELF.fetch(`https://proxy/t/${shard}/${topic}/publish`, {
       method: "POST",
       headers: authHeaders(),
       body: JSON.stringify({ message: "first" }),
     });
     const b1 = await r1.json<{ seq: number }>();
 
-    const r2 = await SELF.fetch(`https://proxy/topic/${topic}/publish`, {
+    const r2 = await SELF.fetch(`https://proxy/t/${shard}/${topic}/publish`, {
       method: "POST",
       headers: authHeaders(),
       body: JSON.stringify({ message: "second" }),
@@ -205,21 +208,21 @@ describe("Worker — POST /topic/:id/publish", () => {
 });
 
 // ---------------------------------------------------------------------------
-// Delete endpoint
+// Delete topic endpoint
 // ---------------------------------------------------------------------------
 
-describe("Worker — DELETE /topic/:id", () => {
+describe("Worker — DELETE /t/:shard/:topic", () => {
   it("deletes a topic and returns success", async () => {
-    const topic = uniqueTopic("del");
+    const { shard, topic, fullId } = uniqueTopic("del");
 
     // First publish a message to ensure the DO exists
-    await SELF.fetch(`https://proxy/topic/${topic}/publish`, {
+    await SELF.fetch(`https://proxy/t/${shard}/${topic}/publish`, {
       method: "POST",
       headers: authHeaders(),
       body: JSON.stringify({ message: "to be deleted" }),
     });
 
-    const response = await SELF.fetch(`https://proxy/topic/${topic}`, {
+    const response = await SELF.fetch(`https://proxy/t/${shard}/${topic}`, {
       method: "DELETE",
       headers: { Authorization: `Bearer ${BACKEND_SECRET}` },
     });
@@ -231,7 +234,70 @@ describe("Worker — DELETE /topic/:id", () => {
       connections_closed: number;
     }>();
     expect(body.deleted).toBe(true);
-    expect(body.topic_id).toBe(topic);
+    expect(body.topic_id).toBe(fullId);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Delete shard endpoint
+// ---------------------------------------------------------------------------
+
+describe("Worker — DELETE /t/:shard", () => {
+  it("deletes all topics in a shard and returns success", async () => {
+    const uid = crypto.randomUUID().slice(0, 8);
+    const shard = `shard-del-${uid}`;
+
+    // Publish to two topics in the same shard
+    await SELF.fetch(`https://proxy/t/${shard}/topicA/publish`, {
+      method: "POST",
+      headers: authHeaders(),
+      body: JSON.stringify({ message: "a" }),
+    });
+    await SELF.fetch(`https://proxy/t/${shard}/topicB/publish`, {
+      method: "POST",
+      headers: authHeaders(),
+      body: JSON.stringify({ message: "b" }),
+    });
+
+    const response = await SELF.fetch(`https://proxy/t/${shard}`, {
+      method: "DELETE",
+      headers: { Authorization: `Bearer ${BACKEND_SECRET}` },
+    });
+    expect(response.status).toBe(200);
+
+    const body = await response.json<{
+      deleted: boolean;
+      shard: string;
+      topics_deleted: number;
+      connections_closed: number;
+    }>();
+    expect(body.deleted).toBe(true);
+    expect(body.shard).toBe(shard);
+    expect(body.topics_deleted).toBe(2);
+  });
+
+  it("sequences restart after shard delete", async () => {
+    const uid = crypto.randomUUID().slice(0, 8);
+    const shard = `shard-seq-${uid}`;
+
+    await SELF.fetch(`https://proxy/t/${shard}/topicA/publish`, {
+      method: "POST",
+      headers: authHeaders(),
+      body: JSON.stringify({ message: "before" }),
+    });
+
+    await SELF.fetch(`https://proxy/t/${shard}`, {
+      method: "DELETE",
+      headers: { Authorization: `Bearer ${BACKEND_SECRET}` },
+    });
+
+    const response = await SELF.fetch(`https://proxy/t/${shard}/topicA/publish`, {
+      method: "POST",
+      headers: authHeaders(),
+      body: JSON.stringify({ message: "after" }),
+    });
+    const body = await response.json<{ seq: number }>();
+    expect(body.seq).toBe(0);
   });
 });
 
@@ -239,19 +305,19 @@ describe("Worker — DELETE /topic/:id", () => {
 // Connect endpoint — auth validation
 // ---------------------------------------------------------------------------
 
-describe("Worker — GET /topic/:id/connect", () => {
+describe("Worker — GET /t/:shard/:topic/connect", () => {
   it("rejects connect without a token", async () => {
-    const topic = uniqueTopic("conn-notoken");
-    const response = await SELF.fetch(`https://proxy/topic/${topic}/connect`, {
+    const { shard, topic } = uniqueTopic("conn-notoken");
+    const response = await SELF.fetch(`https://proxy/t/${shard}/${topic}/connect`, {
       method: "GET",
     });
     expect(response.status).toBe(401);
   });
 
   it("rejects connect with an invalid token", async () => {
-    const topic = uniqueTopic("conn-badtoken");
+    const { shard, topic } = uniqueTopic("conn-badtoken");
     const response = await SELF.fetch(
-      `https://proxy/topic/${topic}/connect?token=invalid.token`,
+      `https://proxy/t/${shard}/${topic}/connect?token=invalid.token`,
       { method: "GET" }
     );
     expect(response.status).toBe(401);
@@ -268,7 +334,7 @@ describe("Worker — POST /bulk-publish", () => {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
-        messages: [{ topic_id: "test", message: "hello" }],
+        messages: [{ topic_id: "shard/topic", message: "hello" }],
       }),
     });
     expect(response.status).toBe(401);
@@ -294,27 +360,38 @@ describe("Worker — POST /bulk-publish", () => {
     expect(response.status).toBe(400);
   });
 
+  it("rejects messages with invalid topic_id format", async () => {
+    const response = await SELF.fetch("https://proxy/bulk-publish", {
+      method: "POST",
+      headers: authHeaders(),
+      body: JSON.stringify({
+        messages: [{ topic_id: "no-slash", message: "hello" }],
+      }),
+    });
+    expect(response.status).toBe(400);
+  });
+
   it("rejects messages with missing message field", async () => {
     const response = await SELF.fetch("https://proxy/bulk-publish", {
       method: "POST",
       headers: authHeaders(),
       body: JSON.stringify({
-        messages: [{ topic_id: "test" }],
+        messages: [{ topic_id: "shard/topic" }],
       }),
     });
     expect(response.status).toBe(400);
   });
 
   it("publishes multiple messages to a single topic", async () => {
-    const topic = uniqueTopic("bulk-single");
+    const { fullId } = uniqueTopic("bulk-single");
     const response = await SELF.fetch("https://proxy/bulk-publish", {
       method: "POST",
       headers: authHeaders(),
       body: JSON.stringify({
         messages: [
-          { topic_id: topic, message: "first" },
-          { topic_id: topic, message: "second" },
-          { topic_id: topic, message: "third" },
+          { topic_id: fullId, message: "first" },
+          { topic_id: fullId, message: "second" },
+          { topic_id: fullId, message: "third" },
         ],
       }),
     });
@@ -333,14 +410,17 @@ describe("Worker — POST /bulk-publish", () => {
     expect(body.topics).toBe(1);
     expect(body.messages).toBe(3);
     expect(body.results).toHaveLength(1);
-    expect(body.results[0]!.topic_id).toBe(topic);
+    expect(body.results[0]!.topic_id).toBe(fullId);
     expect(body.results[0]!.messages_published).toBe(3);
     expect(body.results[0]!.last_seq - body.results[0]!.first_seq).toBe(2);
   });
 
-  it("publishes messages across multiple topics", async () => {
-    const topicA = uniqueTopic("bulk-a");
-    const topicB = uniqueTopic("bulk-b");
+  it("publishes messages across multiple topics in the same shard", async () => {
+    const uid = crypto.randomUUID().slice(0, 8);
+    const shard = `bulk-same-${uid}`;
+    const topicA = `${shard}/topicA`;
+    const topicB = `${shard}/topicB`;
+
     const response = await SELF.fetch("https://proxy/bulk-publish", {
       method: "POST",
       headers: authHeaders(),
@@ -372,11 +452,36 @@ describe("Worker — POST /bulk-publish", () => {
     expect(resultB!.messages_published).toBe(2);
   });
 
+  it("publishes messages across different shards", async () => {
+    const uidA = crypto.randomUUID().slice(0, 8);
+    const uidB = crypto.randomUUID().slice(0, 8);
+    const topicA = `shard-a-${uidA}/topic`;
+    const topicB = `shard-b-${uidB}/topic`;
+
+    const response = await SELF.fetch("https://proxy/bulk-publish", {
+      method: "POST",
+      headers: authHeaders(),
+      body: JSON.stringify({
+        messages: [
+          { topic_id: topicA, message: "a1" },
+          { topic_id: topicB, message: "b1" },
+        ],
+      }),
+    });
+    expect(response.status).toBe(200);
+
+    const body = await response.json<{
+      topics: number;
+      results: Array<{ topic_id: string }>;
+    }>();
+    expect(body.topics).toBe(2);
+  });
+
   it("assigns incrementing sequence numbers within a batch", async () => {
-    const topic = uniqueTopic("bulk-seq");
+    const { shard, topic, fullId } = uniqueTopic("bulk-seq");
 
     // First, publish a single message to establish seq 0
-    await SELF.fetch(`https://proxy/topic/${topic}/publish`, {
+    await SELF.fetch(`https://proxy/t/${shard}/${topic}/publish`, {
       method: "POST",
       headers: authHeaders(),
       body: JSON.stringify({ message: "seed" }),
@@ -388,8 +493,8 @@ describe("Worker — POST /bulk-publish", () => {
       headers: authHeaders(),
       body: JSON.stringify({
         messages: [
-          { topic_id: topic, message: "batch1" },
-          { topic_id: topic, message: "batch2" },
+          { topic_id: fullId, message: "batch1" },
+          { topic_id: fullId, message: "batch2" },
         ],
       }),
     });
@@ -398,6 +503,99 @@ describe("Worker — POST /bulk-publish", () => {
     }>();
     expect(body.results[0]!.first_seq).toBe(1);
     expect(body.results[0]!.last_seq).toBe(2);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Multi-topic isolation
+// ---------------------------------------------------------------------------
+
+describe("Worker — multi-topic isolation", () => {
+  it("topics in the same shard have independent sequences", async () => {
+    const uid = crypto.randomUUID().slice(0, 8);
+    const shard = `iso-seq-${uid}`;
+
+    // Publish 3 to topicA
+    for (let i = 0; i < 3; i++) {
+      const r = await SELF.fetch(`https://proxy/t/${shard}/topicA/publish`, {
+        method: "POST",
+        headers: authHeaders(),
+        body: JSON.stringify({ message: `a-${i}` }),
+      });
+      const body = await r.json<{ seq: number }>();
+      expect(body.seq).toBe(i);
+    }
+
+    // topicB starts from 0 independently
+    const r = await SELF.fetch(`https://proxy/t/${shard}/topicB/publish`, {
+      method: "POST",
+      headers: authHeaders(),
+      body: JSON.stringify({ message: "b-0" }),
+    });
+    const body = await r.json<{ seq: number }>();
+    expect(body.seq).toBe(0);
+  });
+
+  it("deleting one topic doesn't affect another in the same shard", async () => {
+    const uid = crypto.randomUUID().slice(0, 8);
+    const shard = `iso-del-${uid}`;
+
+    // Publish to both topics
+    await SELF.fetch(`https://proxy/t/${shard}/topicA/publish`, {
+      method: "POST",
+      headers: authHeaders(),
+      body: JSON.stringify({ message: "a" }),
+    });
+    await SELF.fetch(`https://proxy/t/${shard}/topicB/publish`, {
+      method: "POST",
+      headers: authHeaders(),
+      body: JSON.stringify({ message: "b" }),
+    });
+
+    // Delete only topicA
+    await SELF.fetch(`https://proxy/t/${shard}/topicA`, {
+      method: "DELETE",
+      headers: { Authorization: `Bearer ${BACKEND_SECRET}` },
+    });
+
+    // topicA restarts from 0
+    const rA = await SELF.fetch(`https://proxy/t/${shard}/topicA/publish`, {
+      method: "POST",
+      headers: authHeaders(),
+      body: JSON.stringify({ message: "a-new" }),
+    });
+    const bodyA = await rA.json<{ seq: number }>();
+    expect(bodyA.seq).toBe(0);
+
+    // topicB continues from 1
+    const rB = await SELF.fetch(`https://proxy/t/${shard}/topicB/publish`, {
+      method: "POST",
+      headers: authHeaders(),
+      body: JSON.stringify({ message: "b-2" }),
+    });
+    const bodyB = await rB.json<{ seq: number }>();
+    expect(bodyB.seq).toBe(1);
+  });
+
+  it("topics in the same shard have independent generations", async () => {
+    const uid = crypto.randomUUID().slice(0, 8);
+    const shard = `iso-gen-${uid}`;
+
+    const rA = await SELF.fetch(`https://proxy/t/${shard}/topicA/publish`, {
+      method: "POST",
+      headers: authHeaders(),
+      body: JSON.stringify({ message: "a" }),
+    });
+    const bodyA = await rA.json<{ generation: string }>();
+
+    const rB = await SELF.fetch(`https://proxy/t/${shard}/topicB/publish`, {
+      method: "POST",
+      headers: authHeaders(),
+      body: JSON.stringify({ message: "b" }),
+    });
+    const bodyB = await rB.json<{ generation: string }>();
+
+    expect(bodyA.generation).not.toBe(bodyB.generation);
   });
 });
 

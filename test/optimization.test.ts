@@ -20,18 +20,22 @@ function authHeaders(): HeadersInit {
 }
 
 /** Unique topic per test to avoid cross-contamination (isolatedStorage is off). */
-function uniqueTopic(prefix: string): string {
-  return `${prefix}-${crypto.randomUUID().slice(0, 8)}`;
+function uniqueTopic(prefix: string): { shard: string; topic: string; fullId: string } {
+  const uid = crypto.randomUUID().slice(0, 8);
+  const shard = `${prefix}-${uid}`;
+  const topic = "t";
+  return { shard, topic, fullId: `${shard}/${topic}` };
 }
 
 /** Publish a single message, returning parsed response. */
 async function publish(
-  topic: string,
+  fullId: string,
   message: string,
   opts: { ttl?: number; max_buffer?: number; encoding?: string } = {}
 ) {
+  const [shard, topic] = fullId.split("/");
   const response = await SELF.fetch(
-    `https://proxy/topic/${topic}/publish`,
+    `https://proxy/t/${shard}/${topic}/publish`,
     {
       method: "POST",
       headers: authHeaders(),
@@ -51,7 +55,7 @@ async function publish(
 
 /** Batch-publish to a single topic, returning parsed response. */
 async function batchPublish(
-  topic: string,
+  fullId: string,
   messages: string[],
   opts: { ttl?: number; max_buffer?: number } = {}
 ) {
@@ -59,7 +63,7 @@ async function batchPublish(
     method: "POST",
     headers: authHeaders(),
     body: JSON.stringify({
-      messages: messages.map((m) => ({ topic_id: topic, message: m })),
+      messages: messages.map((m) => ({ topic_id: fullId, message: m })),
       ...opts,
     }),
   });
@@ -82,8 +86,9 @@ async function batchPublish(
 }
 
 /** Delete a topic, returning parsed response. */
-async function deleteTopic(topic: string) {
-  const response = await SELF.fetch(`https://proxy/topic/${topic}`, {
+async function deleteTopic(fullId: string) {
+  const [shard, topic] = fullId.split("/");
+  const response = await SELF.fetch(`https://proxy/t/${shard}/${topic}`, {
     method: "DELETE",
     headers: { Authorization: `Bearer ${BACKEND_SECRET}` },
   });
@@ -97,9 +102,10 @@ async function deleteTopic(topic: string) {
   };
 }
 
-/** Get a DO stub for a topic (for alarm testing). */
-function getStub(topic: string) {
-  const id = env.PROXY_DO.idFromName(topic);
+/** Get a DO stub for a topic (for alarm testing). Uses the shard key. */
+function getStub(fullId: string) {
+  const shard = fullId.split("/")[0]!;
+  const id = env.PROXY_DO.idFromName(shard);
   return env.PROXY_DO.get(id);
 }
 
@@ -109,14 +115,14 @@ function getStub(topic: string) {
 
 describe("Topic generation hash", () => {
   it("first publish returns a non-empty generation", async () => {
-    const topic = uniqueTopic("gen-first");
+    const { fullId: topic } = uniqueTopic("gen-first");
     const { body } = await publish(topic, "hello");
     expect(body.generation).toBeDefined();
     expect(body.generation.length).toBeGreaterThan(0);
   });
 
   it("generation stays stable across publishes within same lifecycle", async () => {
-    const topic = uniqueTopic("gen-stable");
+    const { fullId: topic } = uniqueTopic("gen-stable");
 
     const { body: b1 } = await publish(topic, "msg-1");
     const { body: b2 } = await publish(topic, "msg-2");
@@ -127,7 +133,7 @@ describe("Topic generation hash", () => {
   });
 
   it("batch-publish returns the same generation as single publish", async () => {
-    const topic = uniqueTopic("gen-batch");
+    const { fullId: topic } = uniqueTopic("gen-batch");
 
     const { body: single } = await publish(topic, "seed");
     const { body: batch } = await batchPublish(topic, ["a", "b"]);
@@ -136,7 +142,7 @@ describe("Topic generation hash", () => {
   });
 
   it("generation changes after delete + recreate", async () => {
-    const topic = uniqueTopic("gen-recycle");
+    const { fullId: topic } = uniqueTopic("gen-recycle");
 
     const { body: before } = await publish(topic, "before");
     const gen1 = before.generation;
@@ -151,7 +157,7 @@ describe("Topic generation hash", () => {
   });
 
   it("generation changes after alarm-based expiry + recreate", async () => {
-    const topic = uniqueTopic("gen-expire");
+    const { fullId: topic } = uniqueTopic("gen-expire");
 
     const { body: before } = await publish(topic, "ephemeral", { ttl: 1 });
     const gen1 = before.generation;
@@ -169,8 +175,8 @@ describe("Topic generation hash", () => {
   });
 
   it("two different topics get different generations", async () => {
-    const topicA = uniqueTopic("gen-diff-a");
-    const topicB = uniqueTopic("gen-diff-b");
+    const { fullId: topicA } = uniqueTopic("gen-diff-a");
+    const { fullId: topicB } = uniqueTopic("gen-diff-b");
 
     const { body: a } = await publish(topicA, "a");
     const { body: b } = await publish(topicB, "b");
@@ -185,7 +191,7 @@ describe("Topic generation hash", () => {
 
 describe("Static topic config", () => {
   it("TTL is locked on first publish", async () => {
-    const topic = uniqueTopic("static-ttl");
+    const { fullId: topic } = uniqueTopic("static-ttl");
 
     // First publish sets TTL to 3600
     await publish(topic, "msg-0", { ttl: 3600 });
@@ -208,7 +214,7 @@ describe("Static topic config", () => {
   });
 
   it("max_buffer is locked on first publish", async () => {
-    const topic = uniqueTopic("static-buf");
+    const { fullId: topic } = uniqueTopic("static-buf");
 
     // First publish sets max_buffer=10
     for (let i = 0; i < 5; i++) {
@@ -230,7 +236,7 @@ describe("Static topic config", () => {
   });
 
   it("batch-publish also locks config on first publish", async () => {
-    const topic = uniqueTopic("static-batch");
+    const { fullId: topic } = uniqueTopic("static-batch");
 
     // First event is a batch publish with specific config
     const { body: b1 } = await batchPublish(topic, ["a", "b", "c"], {
@@ -252,7 +258,7 @@ describe("Static topic config", () => {
   });
 
   it("config is fresh after delete", async () => {
-    const topic = uniqueTopic("static-after-del");
+    const { fullId: topic } = uniqueTopic("static-after-del");
 
     // Create with max_buffer=10
     await publish(topic, "old", { max_buffer: 10, ttl: 3600 });
@@ -276,13 +282,13 @@ describe("Static topic config", () => {
 
 describe("Optimization — meta caching & coalesced writes", () => {
   it("first publish to a new topic starts at seq 0", async () => {
-    const topic = uniqueTopic("meta-first");
+    const { fullId: topic } = uniqueTopic("meta-first");
     const { body } = await publish(topic, "first message");
     expect(body.seq).toBe(0);
   });
 
   it("sequential publishes produce monotonically increasing seqs", async () => {
-    const topic = uniqueTopic("meta-seq");
+    const { fullId: topic } = uniqueTopic("meta-seq");
     const seqs: number[] = [];
 
     for (let i = 0; i < 10; i++) {
@@ -299,7 +305,7 @@ describe("Optimization — meta caching & coalesced writes", () => {
   });
 
   it("meta persists correctly across interleaved publish and batch-publish", async () => {
-    const topic = uniqueTopic("meta-interleave");
+    const { fullId: topic } = uniqueTopic("meta-interleave");
 
     // Single publish: seq 0
     const { body: b0 } = await publish(topic, "single-0");
@@ -321,7 +327,7 @@ describe("Optimization — meta caching & coalesced writes", () => {
   });
 
   it("message content is stored correctly with coalesced write", async () => {
-    const topic = uniqueTopic("meta-content");
+    const { fullId: topic } = uniqueTopic("meta-content");
 
     // Publish a base64 message
     const { response, body } = await publish(topic, "SGVsbG8=", {
@@ -336,7 +342,7 @@ describe("Optimization — meta caching & coalesced writes", () => {
   });
 
   it("rapid publishes all get unique sequence numbers", async () => {
-    const topic = uniqueTopic("meta-rapid");
+    const { fullId: topic } = uniqueTopic("meta-rapid");
     const count = 20;
 
     // Fire all publishes as fast as possible
@@ -365,7 +371,7 @@ describe("Optimization — meta caching & coalesced writes", () => {
 
 describe("Optimization — buffer pruning (computePruneKeys)", () => {
   it("messages within max_buffer are not pruned", async () => {
-    const topic = uniqueTopic("prune-within");
+    const { fullId: topic } = uniqueTopic("prune-within");
 
     // First publish sets max_buffer=5
     for (let i = 0; i < 3; i++) {
@@ -375,7 +381,7 @@ describe("Optimization — buffer pruning (computePruneKeys)", () => {
   });
 
   it("publishes exceeding max_buffer produce correct seqs", async () => {
-    const topic = uniqueTopic("prune-exceed");
+    const { fullId: topic } = uniqueTopic("prune-exceed");
 
     // First publish sets max_buffer=3, subsequent publishes use same config
     for (let i = 0; i < 6; i++) {
@@ -388,7 +394,7 @@ describe("Optimization — buffer pruning (computePruneKeys)", () => {
   });
 
   it("publishes continue correctly after heavy pruning", async () => {
-    const topic = uniqueTopic("prune-heavy");
+    const { fullId: topic } = uniqueTopic("prune-heavy");
 
     // max_buffer=2 — aggressive pruning on every publish after the second
     for (let i = 0; i < 20; i++) {
@@ -401,7 +407,7 @@ describe("Optimization — buffer pruning (computePruneKeys)", () => {
   });
 
   it("batch-publish with small max_buffer prunes correctly", async () => {
-    const topic = uniqueTopic("prune-batch");
+    const { fullId: topic } = uniqueTopic("prune-batch");
 
     // First batch sets max_buffer=3
     const { response, body } = await batchPublish(
@@ -420,7 +426,7 @@ describe("Optimization — buffer pruning (computePruneKeys)", () => {
   });
 
   it("pruning with max_buffer=1 keeps only the latest message", async () => {
-    const topic = uniqueTopic("prune-one");
+    const { fullId: topic } = uniqueTopic("prune-one");
 
     for (let i = 0; i < 5; i++) {
       const { body } = await publish(topic, `msg-${i}`, { max_buffer: 1 });
@@ -438,7 +444,7 @@ describe("Optimization — buffer pruning (computePruneKeys)", () => {
 
 describe("Optimization — delete resets cached state", () => {
   it("publish after delete restarts sequences from 0", async () => {
-    const topic = uniqueTopic("del-reset");
+    const { fullId: topic } = uniqueTopic("del-reset");
 
     for (let i = 0; i < 5; i++) {
       await publish(topic, `msg-${i}`);
@@ -453,7 +459,7 @@ describe("Optimization — delete resets cached state", () => {
   });
 
   it("batch-publish after delete restarts sequences from 0", async () => {
-    const topic = uniqueTopic("del-batch-reset");
+    const { fullId: topic } = uniqueTopic("del-batch-reset");
 
     await batchPublish(topic, ["a", "b", "c"]);
     await deleteTopic(topic);
@@ -464,7 +470,7 @@ describe("Optimization — delete resets cached state", () => {
   });
 
   it("delete is idempotent on an empty topic", async () => {
-    const topic = uniqueTopic("del-empty");
+    const { fullId: topic } = uniqueTopic("del-empty");
 
     const { response, body } = await deleteTopic(topic);
     expect(response.status).toBe(200);
@@ -473,7 +479,7 @@ describe("Optimization — delete resets cached state", () => {
   });
 
   it("double delete does not break state", async () => {
-    const topic = uniqueTopic("del-double");
+    const { fullId: topic } = uniqueTopic("del-double");
 
     await publish(topic, "message");
     await deleteTopic(topic);
@@ -485,7 +491,7 @@ describe("Optimization — delete resets cached state", () => {
   });
 
   it("repeated publish-delete cycles each start from seq 0", async () => {
-    const topic = uniqueTopic("del-cycle");
+    const { fullId: topic } = uniqueTopic("del-cycle");
 
     for (let cycle = 0; cycle < 3; cycle++) {
       for (let i = 0; i < 3; i++) {
@@ -497,7 +503,7 @@ describe("Optimization — delete resets cached state", () => {
   });
 
   it("delete clears alarm state so new publishes can set alarms", async () => {
-    const topic = uniqueTopic("del-alarm");
+    const { fullId: topic } = uniqueTopic("del-alarm");
 
     await publish(topic, "with-alarm", { ttl: 60 });
     await deleteTopic(topic);
@@ -515,7 +521,7 @@ describe("Optimization — delete resets cached state", () => {
 
 describe("Optimization — alarm cleanup", () => {
   it("alarm cleans up expired messages and tears down topic", async () => {
-    const topic = uniqueTopic("alarm-cleanup");
+    const { fullId: topic } = uniqueTopic("alarm-cleanup");
 
     for (let i = 0; i < 5; i++) {
       await publish(topic, `msg-${i}`, { ttl: 1 });
@@ -532,7 +538,7 @@ describe("Optimization — alarm cleanup", () => {
   });
 
   it("alarm keeps non-expired messages", async () => {
-    const topic = uniqueTopic("alarm-keep");
+    const { fullId: topic } = uniqueTopic("alarm-keep");
 
     for (let i = 0; i < 5; i++) {
       await publish(topic, `msg-${i}`, { ttl: 3600 });
@@ -547,7 +553,7 @@ describe("Optimization — alarm cleanup", () => {
   });
 
   it("alarm running on empty topic does not break state", async () => {
-    const topic = uniqueTopic("alarm-empty");
+    const { fullId: topic } = uniqueTopic("alarm-empty");
 
     await publish(topic, "seed", { ttl: 1 });
     await deleteTopic(topic);
@@ -560,7 +566,7 @@ describe("Optimization — alarm cleanup", () => {
   });
 
   it("alarm with partially expired messages keeps survivors", async () => {
-    const topic = uniqueTopic("alarm-partial");
+    const { fullId: topic } = uniqueTopic("alarm-partial");
 
     // Publish with TTL=1 (static for this topic)
     for (let i = 0; i < 3; i++) {
@@ -587,7 +593,7 @@ describe("Optimization — alarm cleanup", () => {
   });
 
   it("multiple alarm invocations are safe", async () => {
-    const topic = uniqueTopic("alarm-multi");
+    const { fullId: topic } = uniqueTopic("alarm-multi");
 
     await publish(topic, "msg-0", { ttl: 1 });
     await new Promise((resolve) => setTimeout(resolve, 1100));
@@ -602,7 +608,7 @@ describe("Optimization — alarm cleanup", () => {
   });
 
   it("alarm after heavy pruning handles gaps correctly", async () => {
-    const topic = uniqueTopic("alarm-gaps");
+    const { fullId: topic } = uniqueTopic("alarm-gaps");
 
     // max_buffer=3, TTL=1 — creates pruning gaps
     for (let i = 0; i < 10; i++) {
@@ -626,7 +632,7 @@ describe("Optimization — alarm cleanup", () => {
 
 describe("Optimization — sequence continuity", () => {
   it("sequences survive publish → prune → batch → delete → publish cycle", async () => {
-    const topic = uniqueTopic("seq-lifecycle");
+    const { fullId: topic } = uniqueTopic("seq-lifecycle");
 
     // Phase 1: Publish 5 messages (max_buffer=3 set on creation)
     for (let i = 0; i < 5; i++) {
@@ -648,8 +654,8 @@ describe("Optimization — sequence continuity", () => {
   });
 
   it("bulk-publish across two topics maintains independent sequences", async () => {
-    const topicA = uniqueTopic("seq-ind-a");
-    const topicB = uniqueTopic("seq-ind-b");
+    const { fullId: topicA } = uniqueTopic("seq-ind-a");
+    const { fullId: topicB } = uniqueTopic("seq-ind-b");
 
     // Publish to topic A first
     await publish(topicA, "a-seed");
@@ -685,7 +691,7 @@ describe("Optimization — sequence continuity", () => {
   });
 
   it("concurrent publishes to same topic all get unique seqs", async () => {
-    const topic = uniqueTopic("seq-concurrent");
+    const { fullId: topic } = uniqueTopic("seq-concurrent");
 
     const results = await Promise.all(
       Array.from({ length: 15 }, (_, i) =>
@@ -702,7 +708,7 @@ describe("Optimization — sequence continuity", () => {
   });
 
   it("sequences correct after alarm cleanup and continued publishing", async () => {
-    const topic = uniqueTopic("seq-alarm-cont");
+    const { fullId: topic } = uniqueTopic("seq-alarm-cont");
 
     for (let i = 0; i < 5; i++) {
       await publish(topic, `old-${i}`, { ttl: 1 });
@@ -727,7 +733,7 @@ describe("Optimization — sequence continuity", () => {
 
 describe("Optimization — ensureAlarm caching", () => {
   it("multiple publishes to same topic succeed (alarm only set once)", async () => {
-    const topic = uniqueTopic("alarm-cache");
+    const { fullId: topic } = uniqueTopic("alarm-cache");
 
     for (let i = 0; i < 10; i++) {
       const { response } = await publish(topic, `msg-${i}`, { ttl: 3600 });
@@ -736,7 +742,7 @@ describe("Optimization — ensureAlarm caching", () => {
   });
 
   it("alarm set correctly after delete clears alarm cache", async () => {
-    const topic = uniqueTopic("alarm-after-del");
+    const { fullId: topic } = uniqueTopic("alarm-after-del");
 
     await publish(topic, "first", { ttl: 60 });
     await deleteTopic(topic);
@@ -754,7 +760,7 @@ describe("Optimization — ensureAlarm caching", () => {
   });
 
   it("batch-publish also uses cached alarm state", async () => {
-    const topic = uniqueTopic("alarm-batch-cache");
+    const { fullId: topic } = uniqueTopic("alarm-batch-cache");
 
     await publish(topic, "seed", { ttl: 3600 });
 
@@ -768,7 +774,7 @@ describe("Optimization — ensureAlarm caching", () => {
   });
 
   it("alarm clears and republish re-sets alarm correctly", async () => {
-    const topic = uniqueTopic("alarm-clear-reset");
+    const { fullId: topic } = uniqueTopic("alarm-clear-reset");
 
     await publish(topic, "to-expire", { ttl: 1 });
 
@@ -789,7 +795,7 @@ describe("Optimization — ensureAlarm caching", () => {
 
 describe("Optimization — edge cases", () => {
   it("max_buffer=0 is handled gracefully", async () => {
-    const topic = uniqueTopic("edge-zero-buf");
+    const { fullId: topic } = uniqueTopic("edge-zero-buf");
 
     const { response, body } = await publish(topic, "zero-buf", {
       max_buffer: 0,
@@ -799,7 +805,7 @@ describe("Optimization — edge cases", () => {
   });
 
   it("very large batch-publish succeeds", async () => {
-    const topic = uniqueTopic("edge-large-batch");
+    const { fullId: topic } = uniqueTopic("edge-large-batch");
     const messages = Array.from({ length: 50 }, (_, i) => `msg-${i}`);
 
     const { response, body } = await batchPublish(topic, messages, {
@@ -812,7 +818,7 @@ describe("Optimization — edge cases", () => {
   });
 
   it("large batch-publish with small buffer prunes correctly", async () => {
-    const topic = uniqueTopic("edge-large-prune");
+    const { fullId: topic } = uniqueTopic("edge-large-prune");
     const messages = Array.from({ length: 50 }, (_, i) => `msg-${i}`);
 
     const { response, body } = await batchPublish(topic, messages, {
@@ -826,7 +832,7 @@ describe("Optimization — edge cases", () => {
   });
 
   it("publish with ttl=0 still works", async () => {
-    const topic = uniqueTopic("edge-zero-ttl");
+    const { fullId: topic } = uniqueTopic("edge-zero-ttl");
 
     const { response, body } = await publish(topic, "zero-ttl", { ttl: 0 });
     expect(response.status).toBe(200);
@@ -834,7 +840,7 @@ describe("Optimization — edge cases", () => {
   });
 
   it("alternating single and batch publishes with pruning", async () => {
-    const topic = uniqueTopic("edge-alternate");
+    const { fullId: topic } = uniqueTopic("edge-alternate");
 
     // First publish sets max_buffer=3
     const { body: s1 } = await publish(topic, "s1", { max_buffer: 3 });
@@ -855,7 +861,7 @@ describe("Optimization — edge cases", () => {
   });
 
   it("delete during active alarm cycle does not corrupt state", async () => {
-    const topic = uniqueTopic("edge-del-alarm");
+    const { fullId: topic } = uniqueTopic("edge-del-alarm");
 
     for (let i = 0; i < 5; i++) {
       await publish(topic, `msg-${i}`, { ttl: 1 });
