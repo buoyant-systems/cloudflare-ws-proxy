@@ -49,6 +49,14 @@ export default {
     }
 
     // -----------------------------------------------------------------------
+    // Route: GET /t/:shard/:topic/status
+    // -----------------------------------------------------------------------
+    const statusMatch = matchRoute(method, pathname, "GET", "status");
+    if (statusMatch) {
+      return handleStatus(request, env, statusMatch.shard, statusMatch.topic);
+    }
+
+    // -----------------------------------------------------------------------
     // Route: DELETE /t/:shard/:topic
     // -----------------------------------------------------------------------
     const deleteTopicMatch = matchDeleteTopicRoute(method, pathname);
@@ -344,6 +352,25 @@ async function handleConnect(
       method: "GET",
       headers: request.headers,
     })
+  );
+}
+
+async function handleStatus(
+  request: Request,
+  env: Env,
+  shard: string,
+  topic: string
+): Promise<Response> {
+  const authError = validateBackendAuth(request, env);
+  if (authError) return authError;
+
+  const idError = validateTopicSegments(shard, topic);
+  if (idError) return idError;
+
+  const stub = getStub(env, shard);
+  const doUrl = new URL(`https://do/${shard}/${topic}/status`);
+  return stub.fetch(
+    new Request(doUrl.toString(), { method: "GET" })
   );
 }
 

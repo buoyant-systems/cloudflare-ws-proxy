@@ -318,6 +318,39 @@ ws.onclose = () => {
 
 ---
 
+### Topic Status
+
+Checks whether any WebSocket clients are currently connected to a topic. Use this from your runtime to verify sidecar connectivity before dispatching work.
+
+```
+GET /t/:shard/:topic/status
+```
+
+**Response:**
+```json
+{
+  "topic_id": "user:123/notifications",
+  "connected": true,
+  "connections": 3
+}
+```
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `topic_id` | string | The full topic ID (`shard/topic`) |
+| `connected` | boolean | `true` if at least one WebSocket client is connected |
+| `connections` | number | Number of currently connected WebSocket clients |
+
+> **Note:** This endpoint is safe to call for topics that don't exist yet — it returns `{ "connected": false, "connections": 0 }`. No storage is read; the response comes directly from the in-memory session map.
+
+**Example:**
+```bash
+curl https://your-worker.workers.dev/t/user:123/notifications/status \
+  -H "Authorization: Bearer YOUR_SECRET"
+```
+
+---
+
 ### Delete Topic
 
 Force-closes all WebSocket connections and wipes all buffered messages for a single topic within a shard. Other topics in the same shard are unaffected. The next publish to this topic starts a new lifecycle with a fresh `generation` and sequence numbers from 0.

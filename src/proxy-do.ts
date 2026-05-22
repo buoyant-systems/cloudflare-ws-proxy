@@ -121,6 +121,9 @@ export class ProxyDO extends DurableObject<Env> {
     if (action === "publish") {
       return this.handlePublish(request, shardKey, topicKey);
     }
+    if (action === "status") {
+      return this.handleStatus(shardKey, topicKey);
+    }
     if (action === "delete") {
       return this.handleDelete(topicKey);
     }
@@ -397,6 +400,20 @@ export class ProxyDO extends DurableObject<Env> {
     await this.ensureAlarm(shortestTtl);
 
     return Response.json({ results });
+  }
+
+  // -------------------------------------------------------------------------
+  // /status — Check client connectivity for a topic
+  // -------------------------------------------------------------------------
+
+  private handleStatus(shardKey: string, topicKey: string): Response {
+    const topicSockets = this.topicSessions.get(topicKey);
+    const connections = topicSockets ? topicSockets.size : 0;
+    return Response.json({
+      topic_id: `${shardKey}/${topicKey}`,
+      connected: connections > 0,
+      connections,
+    });
   }
 
   // -------------------------------------------------------------------------

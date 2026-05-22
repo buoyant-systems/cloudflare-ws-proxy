@@ -40,7 +40,16 @@ sequenceDiagram
     end
 
     rect rgb(60, 60, 40)
-    note right of Backend: 4. Teardown (optional)
+    note right of Backend: 4. Check connectivity (optional)
+    Backend->>Worker: GET /topic/:id/status
+    Worker->>DO: Forward status request
+    DO->>DO: Read in-memory session map (no storage I/O)
+    DO-->>Backend: { connected: true, connections: 3 }
+    note right of Backend: Use before dispatching to verify sidecar is reachable
+    end
+
+    rect rgb(60, 60, 40)
+    note right of Backend: 5. Teardown (optional)
     Backend->>Worker: DELETE /topic/:id
     Worker->>DO: Force teardown
     DO->>DO: Close all sockets, deleteAll()
@@ -68,7 +77,7 @@ flowchart LR
         AL -- "prune expired" --> S
     end
 
-    BE["Backend\n(Cloud Run / Lambda)"] -- "HTTP POST/DELETE" --> W
+    BE["Backend\n(Cloud Run / Lambda)"] -- "HTTP POST/GET/DELETE" --> W
     BR["Browser Clients"] <-- "WebSocket\n(hibernated)" --> DO
 ```
 

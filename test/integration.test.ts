@@ -600,6 +600,99 @@ describe("Worker — multi-topic isolation", () => {
 });
 
 // ---------------------------------------------------------------------------
+// Status endpoint
+// ---------------------------------------------------------------------------
+
+describe("Worker — GET /t/:shard/:topic/status", () => {
+  it("requires backend auth", async () => {
+    const { shard, topic } = uniqueTopic("status-noauth");
+    const response = await SELF.fetch(`https://proxy/t/${shard}/${topic}/status`, {
+      method: "GET",
+    });
+    expect(response.status).toBe(401);
+  });
+
+  it("returns connected:false with 0 connections for an existing topic with no clients", async () => {
+    const { shard, topic, fullId } = uniqueTopic("status-noconn");
+
+    // Publish a message so the topic exists in the DO
+    await SELF.fetch(`https://proxy/t/${shard}/${topic}/publish`, {
+      method: "POST",
+      headers: authHeaders(),
+      body: JSON.stringify({ message: "seed" }),
+    });
+
+    const response = await SELF.fetch(`https://proxy/t/${shard}/${topic}/status`, {
+      method: "GET",
+      headers: { Authorization: `Bearer ${BACKEND_SECRET}` },
+    });
+    expect(response.status).toBe(200);
+
+    const body = await response.json<{
+      topic_id: string;
+      connected: boolean;
+      connections: number;
+    }>();
+    expect(body.topic_id).toBe(fullId);
+    expect(body.connected).toBe(false);
+    expect(body.connections).toBe(0);
+  });
+
+  it("returns connected:false for a topic that was never created", async () => {
+    const { shard, topic } = uniqueTopic("status-ghost");
+
+    const response = await SELF.fetch(`https://proxy/t/${shard}/${topic}/status`, {
+      method: "GET",
+      headers: { Authorization: `Bearer ${BACKEND_SECRET}` },
+    });
+    expect(response.status).toBe(200);
+
+    const body = await response.json<{
+      connected: boolean;
+      connections: number;
+    }>();
+    expect(body.connected).toBe(false);
+    expect(body.connections).toBe(0);
+  });
+
+  it("returns connected:false after topic is deleted", async () => {
+    const { shard, topic } = uniqueTopic("status-deleted");
+
+    // Create and then delete the topic
+    await SELF.fetch(`https://proxy/t/${shard}/${topic}/publish`, {
+      method: "POST",
+      headers: authHeaders(),
+      body: JSON.stringify({ message: "will be deleted" }),
+    });
+    await SELF.fetch(`https://proxy/t/${shard}/${topic}`, {
+      method: "DELETE",
+      headers: { Authorization: `Bearer ${BACKEND_SECRET}` },
+    });
+
+    const response = await SELF.fetch(`https://proxy/t/${shard}/${topic}/status`, {
+      method: "GET",
+      headers: { Authorization: `Bearer ${BACKEND_SECRET}` },
+    });
+    expect(response.status).toBe(200);
+
+    const body = await response.json<{
+      connected: boolean;
+      connections: number;
+    }>();
+    expect(body.connected).toBe(false);
+    expect(body.connections).toBe(0);
+  });
+
+  it("rejects invalid shard/topic segments", async () => {
+    const response = await SELF.fetch("https://proxy/t/bad%20id/topic/status", {
+      method: "GET",
+      headers: { Authorization: `Bearer ${BACKEND_SECRET}` },
+    });
+    expect(response.status).toBe(400);
+  });
+});
+
+// ---------------------------------------------------------------------------
 // 404 handling
 // ---------------------------------------------------------------------------
 
