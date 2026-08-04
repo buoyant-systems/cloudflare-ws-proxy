@@ -194,9 +194,11 @@ async function handleBulkPublish(
       encoding?: "text" | "base64";
       ttl?: number;
       max_buffer?: number;
+      ephemeral?: boolean;
     }>;
     ttl?: number;
     max_buffer?: number;
+    ephemeral?: boolean;
   };
   try {
     body = await request.json();
@@ -243,6 +245,7 @@ async function handleBulkPublish(
       messages: Array<{ topicKey: string; message: string; encoding?: "text" | "base64" }>;
       ttl?: number;
       max_buffer?: number;
+      ephemeral?: boolean;
     }
   >();
 
@@ -250,7 +253,7 @@ async function handleBulkPublish(
     const parsed = parseTopicIdFromString(item.topic_id!)!;
     let group = shardGroups.get(parsed.shardKey);
     if (!group) {
-      group = { messages: [], ttl: body.ttl, max_buffer: body.max_buffer };
+      group = { messages: [], ttl: body.ttl, max_buffer: body.max_buffer, ephemeral: body.ephemeral };
       shardGroups.set(parsed.shardKey, group);
     }
     group.messages.push({
@@ -261,6 +264,7 @@ async function handleBulkPublish(
     // Per-message overrides — last one for this shard wins
     if (item.ttl !== undefined) group.ttl = item.ttl;
     if (item.max_buffer !== undefined) group.max_buffer = item.max_buffer;
+    if (item.ephemeral !== undefined) group.ephemeral = item.ephemeral;
   }
 
   // Fan out to DOs in parallel — one request per shard
@@ -276,6 +280,7 @@ async function handleBulkPublish(
             messages: group.messages,
             ttl: group.ttl,
             max_buffer: group.max_buffer,
+            ephemeral: group.ephemeral,
           }),
         })
       );

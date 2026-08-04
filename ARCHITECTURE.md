@@ -94,8 +94,14 @@ stateDiagram-v2
 
     Active --> Destroyed: DELETE /topic/:id
     Hibernating --> Active: Alarm fires (TTL cleanup)
-    Active --> Destroyed: Alarm fires (all messages expired)
+    Active --> Active: Alarm reclaims storage (connections stay open)
     Destroyed --> [*]: Storage wiped, sockets closed
 ```
 
-> **Topic lifecycle:** Each topic's TTL, buffer size, and generation UUID are set once on creation (first publish) and immutable for the topic's lifetime. When a topic is torn down — either by explicit `DELETE` or when all messages expire via TTL — its storage is fully wiped and connections are closed. The next publish creates a new lifecycle with a fresh generation.
+> The TTL alarm only reclaims **storage** — it never closes connections. A topic is `Destroyed` (sockets closed) only by an explicit `DELETE`.
+
+> **Topic lifecycle:** Each topic's TTL, buffer size, `ephemeral` flag, and generation UUID are set once on creation (first publish) and immutable for the topic's lifetime. When a topic is torn down — either by explicit `DELETE` or when all messages expire via TTL — its storage is fully wiped and connections are closed. The next publish creates a new lifecycle with a fresh generation.
+>
+> **No-storage modes:** With `max_buffer: 0`, messages are broadcast live but never staged in storage (nothing to replay), while metadata and the TTL alarm are still persisted. With `ephemeral: true`, the topic skips **all** storage — no messages, no metadata, no alarm, no registry entry — so `generation` and `seq` live only in memory and reset when the Durable Object hibernates.
+>
+> **TTL vs. connections:** The TTL alarm governs **storage only**. When a topic's buffer empties (all messages expired, or immediately for `max_buffer: 0`), the alarm reclaims that topic's storage — messages, metadata, and registry entry — but **leaves its WebSocket connections open**. Hibernated connections cost nothing to hold, so there is no reason to drop them; the next publish simply re-creates the topic with a fresh `generation`, which signals connected clients that history was cleared. Connections are force-closed only by an explicit `DELETE`.

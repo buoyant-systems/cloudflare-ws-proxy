@@ -2,6 +2,7 @@ import {
   env,
   SELF,
   runDurableObjectAlarm,
+  runInDurableObject,
 } from "cloudflare:test";
 import { describe, it, expect } from "vitest";
 
@@ -31,7 +32,7 @@ function uniqueTopic(prefix: string): { shard: string; topic: string; fullId: st
 async function publish(
   fullId: string,
   message: string,
-  opts: { ttl?: number; max_buffer?: number; encoding?: string } = {}
+  opts: { ttl?: number; max_buffer?: number; encoding?: string; ephemeral?: boolean } = {}
 ) {
   const [shard, topic] = fullId.split("/");
   const response = await SELF.fetch(
@@ -57,7 +58,7 @@ async function publish(
 async function batchPublish(
   fullId: string,
   messages: string[],
-  opts: { ttl?: number; max_buffer?: number } = {}
+  opts: { ttl?: number; max_buffer?: number; ephemeral?: boolean } = {}
 ) {
   const response = await SELF.fetch("https://proxy/bulk-publish", {
     method: "POST",
@@ -107,6 +108,32 @@ function getStub(fullId: string) {
   const shard = fullId.split("/")[0]!;
   const id = env.PROXY_DO.idFromName(shard);
   return env.PROXY_DO.get(id);
+}
+
+/** Open a hibernatable client WebSocket to a topic via the auth + connect flow. */
+async function connectClient(fullId: string): Promise<WebSocket> {
+  const [shard, topic] = fullId.split("/");
+  const authRes = await SELF.fetch(`https://proxy/t/${shard}/${topic}/auth`, {
+    method: "POST",
+    headers: authHeaders(),
+  });
+  const { url } = await authRes.json<{ url: string }>();
+  const connectUrl = url.replace(/^wss:/, "https:").replace(/^ws:/, "http:");
+  const res = await SELF.fetch(connectUrl, { headers: { Upgrade: "websocket" } });
+  if (res.status !== 101 || !res.webSocket) {
+    throw new Error(`connect failed: status ${res.status}`);
+  }
+  res.webSocket.accept();
+  return res.webSocket;
+}
+
+/** Read a topic's connection status. */
+async function statusOf(fullId: string) {
+  const [shard, topic] = fullId.split("/");
+  const res = await SELF.fetch(`https://proxy/t/${shard}/${topic}/status`, {
+    headers: authHeaders(),
+  });
+  return res.json<{ connected: boolean; connections: number }>();
 }
 
 // ---------------------------------------------------------------------------
@@ -624,6 +651,56 @@ describe("Optimization — alarm cleanup", () => {
     const { body } = await publish(topic, "after-gaps", { ttl: 3600 });
     expect(body.seq).toBe(0);
   });
+
+  it("TTL expiry reclaims storage but keeps hibernated connections open", async () => {
+    const { fullId: topic } = uniqueTopic("ttl-keeps-conn");
+
+    const ws = await connectClient(topic);
+    // Buffer disabled, short TTL — nothing is retained.
+    await publish(topic, "hello", { ttl: 1, max_buffer: 0 });
+    expect((await statusOf(topic)).connections).toBe(1);
+
+    // Let the TTL lapse and fire the cleanup alarm.
+    await new Promise((resolve) => setTimeout(resolve, 1100));
+    await runDurableObjectAlarm(getStub(topic));
+
+    // The connection is NOT closed by TTL expiry — it costs nothing to hold.
+    expect((await statusOf(topic)).connections).toBe(1);
+
+    // ...but the topic's storage was fully reclaimed.
+    const keys = await runInDurableObject(getStub(topic), async (_i, state) =>
+      [...(await state.storage.list()).keys()]
+    );
+    expect(keys).toHaveLength(0);
+
+    ws.close(1000);
+  });
+
+  it("a connection kept open across TTL expiry still receives new broadcasts", async () => {
+    const { fullId: topic } = uniqueTopic("ttl-conn-live");
+
+    const ws = await connectClient(topic);
+    const received: string[] = [];
+    ws.addEventListener("message", (e) => {
+      if (typeof e.data === "string") received.push(e.data);
+    });
+
+    await publish(topic, "before-expiry", { ttl: 1, max_buffer: 0 });
+
+    // Expire the topic's storage.
+    await new Promise((resolve) => setTimeout(resolve, 1100));
+    await runDurableObjectAlarm(getStub(topic));
+
+    // Storage was flushed → the next publish is a fresh lifecycle (seq 0).
+    const { body } = await publish(topic, "after-expiry", { ttl: 1, max_buffer: 0 });
+    expect(body.seq).toBe(0);
+
+    // The still-open connection receives the post-expiry broadcast.
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    expect(received.some((m) => m.includes("after-expiry"))).toBe(true);
+
+    ws.close(1000);
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -804,6 +881,33 @@ describe("Optimization — edge cases", () => {
     expect(body.seq).toBe(0);
   });
 
+  it("max_buffer=0 persists meta but stores no messages", async () => {
+    const { fullId: topic } = uniqueTopic("edge-zero-nostore");
+
+    await publish(topic, "m0", { max_buffer: 0 });
+    const { body: b1 } = await publish(topic, "m1", { max_buffer: 0 });
+
+    // seq still advances across publishes (durable topic identity)
+    expect(b1.seq).toBe(1);
+
+    const keys = await runInDurableObject(getStub(topic), async (_i, state) =>
+      [...(await state.storage.list()).keys()]
+    );
+    // No message is ever written to storage — nothing to replay at buffer 0
+    expect(keys.some((k) => k.startsWith("msg:t:"))).toBe(false);
+    // ...but metadata is still persisted (stateful default)
+    expect(keys).toContain("meta:t");
+  });
+
+  it("max_buffer=0 keeps generation stable across publishes", async () => {
+    const { fullId: topic } = uniqueTopic("edge-zero-gen");
+
+    const { body: b0 } = await publish(topic, "m0", { max_buffer: 0 });
+    const { body: b1 } = await publish(topic, "m1", { max_buffer: 0 });
+
+    expect(b1.generation).toBe(b0.generation);
+  });
+
   it("very large batch-publish succeeds", async () => {
     const { fullId: topic } = uniqueTopic("edge-large-batch");
     const messages = Array.from({ length: 50 }, (_, i) => `msg-${i}`);
@@ -874,5 +978,82 @@ describe("Optimization — edge cases", () => {
 
     const { body } = await publish(topic, "fresh-after-del-alarm");
     expect(body.seq).toBe(0);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Ephemeral topics — zero durable state
+// ---------------------------------------------------------------------------
+
+describe("Optimization — ephemeral topics", () => {
+  it("ephemeral publish writes nothing to storage and schedules no alarm", async () => {
+    const { fullId: topic } = uniqueTopic("ephemeral-nostore");
+
+    const { response, body } = await publish(topic, "e0", { ephemeral: true });
+    expect(response.status).toBe(200);
+    expect(body.seq).toBe(0);
+    // still succeeds a second time
+    const { response: r1 } = await publish(topic, "e1", { ephemeral: true });
+    expect(r1.status).toBe(200);
+
+    const { keys, alarm } = await runInDurableObject(getStub(topic), async (_i, state) => ({
+      keys: [...(await state.storage.list()).keys()],
+      alarm: await state.storage.getAlarm(),
+    }));
+    // No messages, no meta, no __topics registry entry
+    expect(keys).toHaveLength(0);
+    // No TTL cleanup alarm either
+    expect(alarm).toBeNull();
+  });
+
+  it("ephemeral batch-publish writes nothing to storage", async () => {
+    const { fullId: topic } = uniqueTopic("ephemeral-batch");
+
+    const { body } = await batchPublish(topic, ["a", "b", "c"], {
+      ephemeral: true,
+    });
+    expect(body.results[0]!.messages_published).toBe(3);
+
+    const keys = await runInDurableObject(getStub(topic), async (_i, state) =>
+      [...(await state.storage.list()).keys()]
+    );
+    expect(keys).toHaveLength(0);
+  });
+
+  it("ephemeral flag is locked on first publish", async () => {
+    const { fullId: topic } = uniqueTopic("ephemeral-locked");
+
+    // First publish creates a stateful topic (ephemeral defaults to false)
+    await publish(topic, "s0");
+    // A later publish trying to flip ephemeral is ignored
+    await publish(topic, "s1", { ephemeral: true });
+
+    const keys = await runInDurableObject(getStub(topic), async (_i, state) =>
+      [...(await state.storage.list()).keys()]
+    );
+    // Topic stayed stateful — messages are still stored
+    expect(keys.some((k) => k.startsWith("msg:t:"))).toBe(true);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Connection cleanup
+// ---------------------------------------------------------------------------
+
+describe("Optimization — connection cleanup", () => {
+  it("a client closing without a status code cleans up its session", async () => {
+    const { fullId: topic } = uniqueTopic("close-no-code");
+
+    await publish(topic, "seed");
+    const ws = await connectClient(topic);
+    expect((await statusOf(topic)).connections).toBe(1);
+
+    // Closing with no code makes the peer close code 1005 ("no status
+    // received"), which the WebSocket API refuses to echo. The close handler
+    // must not crash on it, and must still deregister the session.
+    ws.close();
+
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    expect((await statusOf(topic)).connections).toBe(0);
   });
 });

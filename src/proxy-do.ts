@@ -35,6 +35,13 @@ interface TopicMeta {
   maxBufferSize: number;
   /** Set on first publish, immutable for the topic's lifetime */
   messageTtlMs: number;
+  /**
+   * When true, the topic keeps no durable state: messages, meta, alarms, and
+   * the topic registry are never written to storage. Pure live fan-out —
+   * `generation` remints and `seq` resets on each DO wake. Set on first
+   * publish, immutable for the topic's lifetime.
+   */
+  ephemeral: boolean;
 }
 
 interface SessionAttachment {
@@ -181,6 +188,7 @@ export class ProxyDO extends DurableObject<Env> {
       encoding?: "text" | "base64";
       ttl?: number;
       max_buffer?: number;
+      ephemeral?: boolean;
     };
     try {
       body = await request.json();
@@ -205,7 +213,10 @@ export class ProxyDO extends DurableObject<Env> {
       meta.generation = crypto.randomUUID();
       meta.messageTtlMs = (body.ttl ?? DEFAULT_MESSAGE_TTL_MS / 1000) * 1000;
       meta.maxBufferSize = body.max_buffer ?? DEFAULT_MAX_BUFFER_SIZE;
-      await this.registerTopic(topicKey);
+      meta.ephemeral = body.ephemeral ?? false;
+      if (!meta.ephemeral) {
+        await this.registerTopic(topicKey);
+      }
     }
 
     const seq = meta.nextSeq;
@@ -218,20 +229,28 @@ export class ProxyDO extends DurableObject<Env> {
       timestamp: Date.now(),
     };
 
-    // Compute prune keys before writing (mutates meta.oldestSeq)
-    const pruneKeys = this.computePruneKeys(meta, topicKey);
+    if (!meta.ephemeral) {
+      // Only retain the message when the buffer can actually replay it.
+      // With max_buffer=0 the message would be written then immediately pruned,
+      // so skip staging it entirely and just advance oldestSeq to keep
+      // `remaining` (nextSeq - oldestSeq) at 0 for the alarm's teardown logic.
+      const entries: Record<string, unknown> = { [`meta:${topicKey}`]: meta };
+      let pruneKeys: string[] = [];
+      if (meta.maxBufferSize > 0) {
+        entries[`msg:${topicKey}:${seq}`] = storedMessage;
+        pruneKeys = this.computePruneKeys(meta, topicKey);
+      } else {
+        meta.oldestSeq = meta.nextSeq;
+      }
 
-    // Coalesce message + metadata into a single storage write
-    await this.ctx.storage.put({
-      [`msg:${topicKey}:${seq}`]: storedMessage,
-      [`meta:${topicKey}`]: meta,
-    });
-    if (pruneKeys.length > 0) {
-      await this.ctx.storage.delete(pruneKeys);
+      await this.ctx.storage.put(entries);
+      if (pruneKeys.length > 0) {
+        await this.ctx.storage.delete(pruneKeys);
+      }
+
+      // Set alarm for TTL-based cleanup
+      await this.ensureAlarm(meta.messageTtlMs);
     }
-
-    // Set alarm for TTL-based cleanup
-    await this.ensureAlarm(meta.messageTtlMs);
 
     // Broadcast ONLY to this topic's connected WebSockets
     const envelope = JSON.stringify({
@@ -272,6 +291,7 @@ export class ProxyDO extends DurableObject<Env> {
       }>;
       ttl?: number;
       max_buffer?: number;
+      ephemeral?: boolean;
     };
     try {
       body = await request.json();
@@ -318,6 +338,7 @@ export class ProxyDO extends DurableObject<Env> {
     const allEntries: Record<string, unknown> = {};
     const allPruneKeys: string[] = [];
     const results: Array<Record<string, unknown>> = [];
+    let anyPersistent = false;
 
     for (const [topicKey, messages] of byTopic) {
       const meta = await this.getTopicMeta(topicKey);
@@ -327,7 +348,10 @@ export class ProxyDO extends DurableObject<Env> {
         meta.generation = crypto.randomUUID();
         meta.messageTtlMs = (body.ttl ?? DEFAULT_MESSAGE_TTL_MS / 1000) * 1000;
         meta.maxBufferSize = body.max_buffer ?? DEFAULT_MAX_BUFFER_SIZE;
-        await this.registerTopic(topicKey);
+        meta.ephemeral = body.ephemeral ?? false;
+        if (!meta.ephemeral) {
+          await this.registerTopic(topicKey);
+        }
       }
 
       const storedMessages: StoredMessage[] = [];
@@ -345,13 +369,23 @@ export class ProxyDO extends DurableObject<Env> {
         };
 
         storedMessages.push(stored);
-        allEntries[`msg:${topicKey}:${seq}`] = stored;
+        // Only retain messages when the topic is durable and buffers them.
+        if (!meta.ephemeral && meta.maxBufferSize > 0) {
+          allEntries[`msg:${topicKey}:${seq}`] = stored;
+        }
       }
 
-      // Compute prune keys (mutates meta.oldestSeq)
-      allPruneKeys.push(...this.computePruneKeys(meta, topicKey));
-
-      allEntries[`meta:${topicKey}`] = meta;
+      if (!meta.ephemeral) {
+        anyPersistent = true;
+        if (meta.maxBufferSize > 0) {
+          // Compute prune keys (mutates meta.oldestSeq)
+          allPruneKeys.push(...this.computePruneKeys(meta, topicKey));
+        } else {
+          // max_buffer=0: nothing retained; keep remaining (nextSeq-oldestSeq) at 0.
+          meta.oldestSeq = meta.nextSeq;
+        }
+        allEntries[`meta:${topicKey}`] = meta;
+      }
 
       // Broadcast all messages to this topic's connected WebSockets
       const topicSockets = this.topicSessions.get(topicKey) ?? new Set();
@@ -383,21 +417,25 @@ export class ProxyDO extends DurableObject<Env> {
       });
     }
 
-    // Single coalesced storage write for ALL topics in this DO
-    await this.ctx.storage.put(allEntries);
+    // Single coalesced storage write for ALL durable topics in this DO
+    if (Object.keys(allEntries).length > 0) {
+      await this.ctx.storage.put(allEntries);
+    }
     if (allPruneKeys.length > 0) {
       await this.ctx.storage.delete(allPruneKeys);
     }
 
-    // Set alarm using the shortest TTL across all touched topics
-    let shortestTtl = DEFAULT_MESSAGE_TTL_MS;
-    for (const topicKey of byTopic.keys()) {
-      const meta = this.topicMetas.get(topicKey);
-      if (meta && meta.messageTtlMs < shortestTtl) {
-        shortestTtl = meta.messageTtlMs;
+    // Set alarm using the shortest TTL across all touched durable topics
+    if (anyPersistent) {
+      let shortestTtl = DEFAULT_MESSAGE_TTL_MS;
+      for (const topicKey of byTopic.keys()) {
+        const meta = this.topicMetas.get(topicKey);
+        if (meta && !meta.ephemeral && meta.messageTtlMs < shortestTtl) {
+          shortestTtl = meta.messageTtlMs;
+        }
       }
+      await this.ensureAlarm(shortestTtl);
     }
-    await this.ensureAlarm(shortestTtl);
 
     return Response.json({ results });
   }
@@ -471,18 +509,45 @@ export class ProxyDO extends DurableObject<Env> {
     reason: string,
     _wasClean: boolean
   ): Promise<void> {
-    ws.close(code, reason);
+    // Deregister first so cleanup always runs, even if the echo below throws.
     const attachment = ws.deserializeAttachment() as SessionAttachment | null;
     if (attachment) {
       this.topicSessions.get(attachment.topicKey)?.delete(ws);
     }
+    this.closeSocket(ws, code, reason);
   }
 
   async webSocketError(ws: WebSocket, _error: unknown): Promise<void> {
-    ws.close(1011, "WebSocket error");
     const attachment = ws.deserializeAttachment() as SessionAttachment | null;
     if (attachment) {
       this.topicSessions.get(attachment.topicKey)?.delete(ws);
+    }
+    this.closeSocket(ws, 1011, "WebSocket error");
+  }
+
+  /**
+   * Complete the closing handshake for a hibernated socket. The peer-supplied
+   * close code may be a reserved value that `close()` refuses to echo — e.g.
+   * 1005 ("no status", sent when a client closes with no code), 1006
+   * ("abnormal"), 1004, or 1015 — so drop the code for those and close plainly.
+   * Wrapped in try/catch as a final guard against an already-closed socket.
+   */
+  private closeSocket(ws: WebSocket, code: number, reason: string): void {
+    const reserved =
+      code < 1000 ||
+      code > 4999 ||
+      code === 1004 ||
+      code === 1005 ||
+      code === 1006 ||
+      code === 1015;
+    try {
+      if (reserved) {
+        ws.close();
+      } else {
+        ws.close(code, reason);
+      }
+    } catch {
+      // Socket already closed — nothing to do.
     }
   }
 
@@ -540,8 +605,13 @@ export class ProxyDO extends DurableObject<Env> {
           nextAlarmTime = topicNextAlarm;
         }
       } else if (remaining === 0) {
-        // This topic is dead — clean up its storage and close its sockets
-        await this.teardownTopic(topicKey);
+        // No buffered messages remain. Reclaim this topic's storage, but leave
+        // any hibernated client connections open — they cost nothing to hold
+        // and can still receive future broadcasts. A later publish re-creates
+        // the topic with a fresh generation, signalling connected clients that
+        // the message history was cleared. Connections are only force-closed on
+        // an explicit DELETE.
+        await this.flushTopicStorage(topicKey);
       }
     }
 
@@ -572,6 +642,7 @@ export class ProxyDO extends DurableObject<Env> {
       oldestSeq: 0,
       maxBufferSize: DEFAULT_MAX_BUFFER_SIZE,
       messageTtlMs: DEFAULT_MESSAGE_TTL_MS,
+      ephemeral: false,
     };
     this.topicMetas.set(topicKey, meta);
     return meta;
@@ -635,6 +706,8 @@ export class ProxyDO extends DurableObject<Env> {
    */
   private async replayMessages(ws: WebSocket, cursor: number, topicKey: string): Promise<void> {
     const meta = await this.getTopicMeta(topicKey);
+    // Ephemeral topics and zero-size buffers never retain messages.
+    if (meta.ephemeral || meta.maxBufferSize === 0) return;
     // Start from the cursor or the oldest available message, whichever is later
     const start = Math.max(cursor, meta.oldestSeq);
 
@@ -666,8 +739,29 @@ export class ProxyDO extends DurableObject<Env> {
   }
 
   /**
-   * Tear down a single topic — close its sockets, delete its storage,
-   * and unregister it from the active topic index.
+   * Reclaim a topic's persisted state — delete its messages and metadata and
+   * unregister it from the active topic index — WITHOUT touching its WebSocket
+   * connections. Used by the TTL alarm: expiring the message buffer must not
+   * disconnect hibernated clients, which are free to hold. A subsequent publish
+   * re-creates the topic with a fresh generation.
+   */
+  private async flushTopicStorage(topicKey: string): Promise<void> {
+    const meta = this.topicMetas.get(topicKey);
+    if (meta) {
+      const keys: string[] = [`meta:${topicKey}`];
+      for (let seq = meta.oldestSeq; seq < meta.nextSeq; seq++) {
+        keys.push(`msg:${topicKey}:${seq}`);
+      }
+      await this.ctx.storage.delete(keys);
+      this.topicMetas.delete(topicKey);
+    }
+
+    await this.unregisterTopic(topicKey);
+  }
+
+  /**
+   * Tear down a single topic — close its sockets, then reclaim its storage.
+   * Used for explicit teardown (DELETE), where dropping connections is intended.
    */
   private async teardownTopic(topicKey: string): Promise<number> {
     const sockets = this.topicSessions.get(topicKey) ?? new Set();
@@ -681,17 +775,7 @@ export class ProxyDO extends DurableObject<Env> {
     }
     this.topicSessions.delete(topicKey);
 
-    const meta = this.topicMetas.get(topicKey);
-    if (meta) {
-      const keys: string[] = [`meta:${topicKey}`];
-      for (let seq = meta.oldestSeq; seq < meta.nextSeq; seq++) {
-        keys.push(`msg:${topicKey}:${seq}`);
-      }
-      await this.ctx.storage.delete(keys);
-      this.topicMetas.delete(topicKey);
-    }
-
-    await this.unregisterTopic(topicKey);
+    await this.flushTopicStorage(topicKey);
     return count;
   }
 

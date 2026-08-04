@@ -1,0 +1,31 @@
+{
+  "permissions": {
+    "deny": [
+      "Bash(git add*)",
+      "Bash(git rm*)",
+      "Bash(git mv*)",
+      "Bash(git commit*)",
+      "Bash(git blame*)",
+      "Bash(git branch*)",
+      "Bash(git checkout*)",
+      "Bash(git switch*)",
+      "Bash(git push*)",
+      "Bash(git merge*)",
+      "Bash(git rebase*)",
+      "Bash(git reset*)",
+      "Bash(git clean*)",
+      "Bash(git revert*)",
+      "Bash(git cherry-pick*)",
+      "Bash(git stash*)"
+    ],
+    "allow": [
+      "Bash(git status*)",
+      "Bash(git log*)",
+      "Bash(git diff*)",
+      "Bash(git show*)",
+      "Bash(*)",
+      "Read(./**)",
+      "Edit(./**)"
+    ]
+  }
+}

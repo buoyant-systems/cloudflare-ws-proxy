@@ -135,9 +135,10 @@ POST /t/:shard/:topic/publish
 | `message` | string | _required_ | The message payload. For binary data, base64-encode it and set `encoding: "base64"` |
 | `encoding` | string | `"text"` | Set to `"base64"` if `message` contains base64-encoded binary data |
 | `ttl` | number | `3600` (1 hour) | Message time-to-live in seconds. **Set on first publish; ignored on subsequent publishes** |
-| `max_buffer` | number | `100` | Maximum number of messages to buffer. **Set on first publish; ignored on subsequent publishes** |
+| `max_buffer` | number | `100` | Maximum number of messages to buffer. `0` disables buffering — messages are broadcast live only and never written to storage. **Set on first publish; ignored on subsequent publishes** |
+| `ephemeral` | boolean | `false` | If `true`, the topic keeps no durable state at all: messages, metadata, and cleanup alarms are never written to storage (pure live fan-out). `generation` and `seq` are then in-memory only and reset whenever the Durable Object hibernates. **Set on first publish; ignored on subsequent publishes** |
 
-> **Note:** `ttl` and `max_buffer` are locked when the topic is created (first publish). Subsequent publishes to the same topic use the original values. To change them, delete the topic and recreate it.
+> **Note:** `ttl`, `max_buffer`, and `ephemeral` are locked when the topic is created (first publish). Subsequent publishes to the same topic use the original values. To change them, delete the topic and recreate it.
 
 **Response:**
 ```json
@@ -202,7 +203,8 @@ POST /bulk-publish
 | `messages[].message` | string | _required_ | The message payload |
 | `messages[].encoding` | string | `"text"` | Set to `"base64"` for binary data |
 | `ttl` | number | `3600` (1 hour) | TTL in seconds. **Only used when creating a new topic; ignored for existing topics** |
-| `max_buffer` | number | `100` | Buffer size. **Only used when creating a new topic; ignored for existing topics** |
+| `max_buffer` | number | `100` | Buffer size. `0` disables buffering (live broadcast only, no storage). **Only used when creating a new topic; ignored for existing topics** |
+| `ephemeral` | boolean | `false` | If `true`, new topics keep no durable state (live fan-out only, zero storage). **Only used when creating a new topic; ignored for existing topics** |
 
 **Response:**
 ```json
@@ -459,7 +461,9 @@ Each topic has a **static configuration** that is locked on creation (first publ
 - **Buffer size** — maximum number of messages to retain (oldest are pruned when exceeded)
 - **Generation** — a unique UUID identifying this topic lifecycle
 
-When a topic is torn down (via `DELETE` or when all messages expire via TTL), its storage is fully wiped. Other topics in the same shard are unaffected. The next publish creates a **new lifecycle** with a fresh generation, new config, and sequence numbers starting from 0.
+When a topic's storage is reclaimed — either by an explicit `DELETE` or when all its messages expire via TTL — it is fully wiped. Other topics in the same shard are unaffected. The next publish creates a **new lifecycle** with a fresh generation, new config, and sequence numbers starting from 0.
+
+TTL cleanup reclaims **storage only**; it does **not** close client WebSocket connections. Hibernated connections are free to hold, so a topic whose buffer has emptied keeps its clients connected — they continue receiving live broadcasts, observing the generation change as the signal that history was cleared. Connections are force-closed only by an explicit `DELETE`.
 
 Clients can detect topic recycling by comparing the `generation` field in message envelopes. A generation change means the cursor is stale and should be discarded.
 
