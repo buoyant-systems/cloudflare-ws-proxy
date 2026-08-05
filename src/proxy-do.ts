@@ -29,6 +29,13 @@ interface StoredMessage {
 interface TopicMeta {
   /** Random ID created once per topic lifecycle — changes on delete/expire+recreate */
   generation: string;
+  /**
+   * Sequence counters. For buffered topics (maxBufferSize > 0) these are NOT
+   * persisted per publish — they are derived on load from the surviving message
+   * keys (which encode the seq), so `meta` is written only once at creation.
+   * For max_buffer=0 there are no message keys to derive from, so meta (and
+   * these counters) is persisted on every publish instead.
+   */
   nextSeq: number;
   oldestSeq: number;
   /** Set on first publish, immutable for the topic's lifetime */
@@ -55,6 +62,31 @@ interface SessionAttachment {
 
 const DEFAULT_MAX_BUFFER_SIZE = 100;
 const DEFAULT_MESSAGE_TTL_MS = 3600 * 1000; // 1 hour
+
+// Width to zero-pad the seq portion of a message key so keys sort in numeric
+// order under storage.list() (lexicographic). 16 digits covers the full JS
+// safe-integer range (Number.MAX_SAFE_INTEGER ≈ 9.0e15).
+const SEQ_PAD_WIDTH = 16;
+
+/**
+ * Message key: `msg/<topicKey>/<paddedSeq>`.
+ *
+ * Uses `/` as the delimiter (topic segments cannot contain `/`; see
+ * topic-key.ts SEGMENT_REGEX, which does allow `:`), so `msgKeyPrefix(topicKey)`
+ * is an unambiguous prefix — topic `a`'s keys never match topic `a:b`'s. The
+ * zero-padded seq makes lexicographic order match numeric order.
+ */
+function msgKey(topicKey: string, seq: number): string {
+  return `msg/${topicKey}/${String(seq).padStart(SEQ_PAD_WIDTH, "0")}`;
+}
+
+function msgKeyPrefix(topicKey: string): string {
+  return `msg/${topicKey}/`;
+}
+
+function seqFromMsgKey(key: string): number {
+  return parseInt(key.slice(key.lastIndexOf("/") + 1), 10);
+}
 
 // ---------------------------------------------------------------------------
 // ProxyDO
@@ -209,7 +241,8 @@ export class ProxyDO extends DurableObject<Env> {
     const meta = await this.getTopicMeta(topicKey);
 
     // Topic config is set once on first publish, immutable after
-    if (meta.generation === "") {
+    const isNewTopic = meta.generation === "";
+    if (isNewTopic) {
       meta.generation = crypto.randomUUID();
       meta.messageTtlMs = (body.ttl ?? DEFAULT_MESSAGE_TTL_MS / 1000) * 1000;
       meta.maxBufferSize = body.max_buffer ?? DEFAULT_MAX_BUFFER_SIZE;
@@ -230,17 +263,22 @@ export class ProxyDO extends DurableObject<Env> {
     };
 
     if (!meta.ephemeral) {
-      // Only retain the message when the buffer can actually replay it.
-      // With max_buffer=0 the message would be written then immediately pruned,
-      // so skip staging it entirely and just advance oldestSeq to keep
-      // `remaining` (nextSeq - oldestSeq) at 0 for the alarm's teardown logic.
-      const entries: Record<string, unknown> = { [`meta:${topicKey}`]: meta };
+      const entries: Record<string, unknown> = {};
       let pruneKeys: string[] = [];
       if (meta.maxBufferSize > 0) {
-        entries[`msg:${topicKey}:${seq}`] = storedMessage;
+        // Buffered: persist the message (its key encodes the seq). Metadata is
+        // written ONCE, coalesced with the first message; thereafter nextSeq/
+        // oldestSeq are derived from the surviving message keys, so no meta
+        // row-write happens on subsequent publishes.
+        entries[msgKey(topicKey, seq)] = storedMessage;
+        if (isNewTopic) entries[`meta:${topicKey}`] = meta;
         pruneKeys = this.computePruneKeys(meta, topicKey);
       } else {
+        // max_buffer=0: nothing is stored to derive the seq from, so persist
+        // meta on every publish. The message itself is never staged (a 0-size
+        // buffer can never replay it). Keep `remaining` at 0 for the alarm.
         meta.oldestSeq = meta.nextSeq;
+        entries[`meta:${topicKey}`] = meta;
       }
 
       await this.ctx.storage.put(entries);
@@ -344,7 +382,8 @@ export class ProxyDO extends DurableObject<Env> {
       const meta = await this.getTopicMeta(topicKey);
 
       // Topic config is set once on first publish, immutable after
-      if (meta.generation === "") {
+      const isNewTopic = meta.generation === "";
+      if (isNewTopic) {
         meta.generation = crypto.randomUUID();
         meta.messageTtlMs = (body.ttl ?? DEFAULT_MESSAGE_TTL_MS / 1000) * 1000;
         meta.maxBufferSize = body.max_buffer ?? DEFAULT_MAX_BUFFER_SIZE;
@@ -371,7 +410,7 @@ export class ProxyDO extends DurableObject<Env> {
         storedMessages.push(stored);
         // Only retain messages when the topic is durable and buffers them.
         if (!meta.ephemeral && meta.maxBufferSize > 0) {
-          allEntries[`msg:${topicKey}:${seq}`] = stored;
+          allEntries[msgKey(topicKey, seq)] = stored;
         }
       }
 
@@ -380,11 +419,15 @@ export class ProxyDO extends DurableObject<Env> {
         if (meta.maxBufferSize > 0) {
           // Compute prune keys (mutates meta.oldestSeq)
           allPruneKeys.push(...this.computePruneKeys(meta, topicKey));
+          // Buffered: seq counters derive from message keys, so persist meta
+          // only once (coalesced with this batch) at topic creation.
+          if (isNewTopic) allEntries[`meta:${topicKey}`] = meta;
         } else {
-          // max_buffer=0: nothing retained; keep remaining (nextSeq-oldestSeq) at 0.
+          // max_buffer=0: no message keys to derive from — persist meta every
+          // batch. Keep remaining (nextSeq-oldestSeq) at 0 for the alarm.
           meta.oldestSeq = meta.nextSeq;
+          allEntries[`meta:${topicKey}`] = meta;
         }
-        allEntries[`meta:${topicKey}`] = meta;
       }
 
       // Broadcast all messages to this topic's connected WebSockets
@@ -567,7 +610,7 @@ export class ProxyDO extends DurableObject<Env> {
       // Batch-read all remaining messages in a single storage operation
       const allKeys: string[] = [];
       for (let seq = meta.oldestSeq; seq < meta.nextSeq; seq++) {
-        allKeys.push(`msg:${topicKey}:${seq}`);
+        allKeys.push(msgKey(topicKey, seq));
       }
 
       const keysToDelete: string[] = [];
@@ -576,13 +619,13 @@ export class ProxyDO extends DurableObject<Env> {
       if (allKeys.length > 0) {
         const messages = await this.ctx.storage.get<StoredMessage>(allKeys);
         for (let seq = meta.oldestSeq; seq < meta.nextSeq; seq++) {
-          const msg = messages.get(`msg:${topicKey}:${seq}`);
+          const msg = messages.get(msgKey(topicKey, seq));
           if (!msg) {
             // Gap — already deleted (e.g. by pruneBuffer), skip
             continue;
           }
           if (msg.timestamp <= cutoff) {
-            keysToDelete.push(`msg:${topicKey}:${seq}`);
+            keysToDelete.push(msgKey(topicKey, seq));
           } else {
             firstSurvivorTimestamp = msg.timestamp;
             break; // messages are sequential in time — no more expired
@@ -592,8 +635,10 @@ export class ProxyDO extends DurableObject<Env> {
 
       if (keysToDelete.length > 0) {
         await this.ctx.storage.delete(keysToDelete);
+        // oldestSeq is derived from the surviving keys on next load, so only
+        // update the in-memory value (for the remaining check below) — no
+        // meta row-write needed.
         meta.oldestSeq = meta.oldestSeq + keysToDelete.length;
-        await this.ctx.storage.put(`meta:${topicKey}`, meta);
       }
 
       const remaining = meta.nextSeq - meta.oldestSeq;
@@ -644,8 +689,42 @@ export class ProxyDO extends DurableObject<Env> {
       messageTtlMs: DEFAULT_MESSAGE_TTL_MS,
       ephemeral: false,
     };
+
+    // Buffered topics don't persist seq counters per publish — recover them
+    // from the surviving message keys (which encode the seq). max_buffer=0 has
+    // no keys, so it keeps the persisted counters as-is.
+    if (stored && meta.maxBufferSize > 0) {
+      const bounds = await this.deriveSeqBounds(topicKey);
+      if (bounds) {
+        meta.oldestSeq = bounds.oldestSeq;
+        meta.nextSeq = bounds.nextSeq;
+      }
+    }
+
     this.topicMetas.set(topicKey, meta);
     return meta;
+  }
+
+  /**
+   * Recover a buffered topic's seq window from its stored message keys.
+   * Returns the oldest surviving seq and next (highest + 1), or null when no
+   * messages are stored (the caller then keeps the persisted counters).
+   */
+  private async deriveSeqBounds(
+    topicKey: string
+  ): Promise<{ oldestSeq: number; nextSeq: number } | null> {
+    const prefix = msgKeyPrefix(topicKey);
+    const newest = await this.ctx.storage.list<StoredMessage>({
+      prefix,
+      reverse: true,
+      limit: 1,
+    });
+    if (newest.size === 0) return null;
+
+    const oldest = await this.ctx.storage.list<StoredMessage>({ prefix, limit: 1 });
+    const newestSeq = seqFromMsgKey([...newest.keys()][0]!);
+    const oldestSeq = seqFromMsgKey([...oldest.keys()][0]!);
+    return { oldestSeq, nextSeq: newestSeq + 1 };
   }
 
   /**
@@ -661,7 +740,7 @@ export class ProxyDO extends DurableObject<Env> {
     const newOldest = meta.nextSeq - meta.maxBufferSize;
     const keys: string[] = [];
     for (let seq = meta.oldestSeq; seq < newOldest; seq++) {
-      keys.push(`msg:${topicKey}:${seq}`);
+      keys.push(msgKey(topicKey, seq));
     }
 
     meta.oldestSeq = newOldest;
@@ -714,13 +793,13 @@ export class ProxyDO extends DurableObject<Env> {
     // Batch-read all replay keys in a single storage operation
     const keys: string[] = [];
     for (let seq = start; seq < meta.nextSeq; seq++) {
-      keys.push(`msg:${topicKey}:${seq}`);
+      keys.push(msgKey(topicKey, seq));
     }
     if (keys.length === 0) return;
 
     const messages = await this.ctx.storage.get<StoredMessage>(keys);
     for (let seq = start; seq < meta.nextSeq; seq++) {
-      const msg = messages.get(`msg:${topicKey}:${seq}`);
+      const msg = messages.get(msgKey(topicKey, seq));
       if (!msg) continue; // gap from TTL expiry
       try {
         ws.send(
@@ -746,15 +825,18 @@ export class ProxyDO extends DurableObject<Env> {
    * re-creates the topic with a fresh generation.
    */
   private async flushTopicStorage(topicKey: string): Promise<void> {
-    const meta = this.topicMetas.get(topicKey);
-    if (meta) {
-      const keys: string[] = [`meta:${topicKey}`];
+    // Load meta (cache hit on the alarm path; a fresh load recovers the seq
+    // window from message keys otherwise) so the delete range is correct even
+    // when called on a freshly-woken DO with an empty cache — e.g. a DELETE.
+    const meta = await this.getTopicMeta(topicKey);
+    const keys: string[] = [`meta:${topicKey}`];
+    if (meta.maxBufferSize > 0) {
       for (let seq = meta.oldestSeq; seq < meta.nextSeq; seq++) {
-        keys.push(`msg:${topicKey}:${seq}`);
+        keys.push(msgKey(topicKey, seq));
       }
-      await this.ctx.storage.delete(keys);
-      this.topicMetas.delete(topicKey);
     }
+    await this.ctx.storage.delete(keys);
+    this.topicMetas.delete(topicKey);
 
     await this.unregisterTopic(topicKey);
   }

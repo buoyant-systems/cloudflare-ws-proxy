@@ -467,6 +467,21 @@ TTL cleanup reclaims **storage only**; it does **not** close client WebSocket co
 
 Clients can detect topic recycling by comparing the `generation` field in message envelopes. A generation change means the cursor is stale and should be discarded.
 
+### Durability & cost tiers
+
+`max_buffer` and `ephemeral` select how much durable state a topic keeps, trading Durable Object storage writes against durability guarantees. SQLite row *writes* dominate the storage cost of this proxy, so this is the main cost lever:
+
+| Mode | Steady state writes per publish | `generation` | `seq` across hibernation | Message replay |
+|------|--------------------------|--------------|--------------------------|----------------|
+| `ephemeral: true` | 0 | remints on wake | resets | none |
+| `max_buffer: 0` | 1 | stable | monotonic | none |
+| `max_buffer > 0` (default) | 2 | stable | monotonic | yes, up to buffer size |
+
+Notes:
+
+- **`ephemeral`** is pure live fan-out — no messages, metadata, alarms, or registry entries are written. `generation` and `seq` live only in memory and reset whenever the Durable Object hibernates. Use it when you never replay and don't need a stable topic identity.
+- Buffered topics (`max_buffer > 0`) make 3 writes on the first publish, then 1 while filling, then 2 once at capacity.
+
 ## Configuration
 
 | Environment Variable | Required | Description |

@@ -368,6 +368,64 @@ describe("Optimization — meta caching & coalesced writes", () => {
     expect(b2.seq).toBe(1);
   });
 
+  it("buffered topic does not rewrite meta on every publish", async () => {
+    const { fullId: topic } = uniqueTopic("writeonce-meta");
+
+    // Three publishes to a buffered topic (seqs 0, 1, 2).
+    await publish(topic, "m0");
+    await publish(topic, "m1");
+    await publish(topic, "m2");
+
+    // meta is written ONCE at creation (with the post-first-publish nextSeq=1)
+    // and never rewritten — the live nextSeq (3) lives only in memory / keys.
+    const storedMeta = await runInDurableObject(getStub(topic), async (_i, state) =>
+      state.storage.get<{ nextSeq: number }>("meta:t")
+    );
+    expect(storedMeta!.nextSeq).toBe(1);
+  });
+
+  it("buffered seq is recovered from message keys after cache loss", async () => {
+    const { fullId: topic } = uniqueTopic("derive-seq");
+
+    await publish(topic, "m0");
+    await publish(topic, "m1");
+    await publish(topic, "m2"); // seqs 0, 1, 2
+
+    // Simulate hibernation: drop the in-memory meta cache so the next publish
+    // must recover nextSeq from the stored message keys, not persisted meta
+    // (whose nextSeq is stale at 1).
+    await runInDurableObject(getStub(topic), (instance) => {
+      (instance as unknown as { topicMetas: Map<string, unknown> }).topicMetas.clear();
+    });
+
+    const { body } = await publish(topic, "m3");
+    expect(body.seq).toBe(3);
+  });
+
+  it("oldestSeq is recovered from message keys after cache loss (pruning continues)", async () => {
+    const { fullId: topic } = uniqueTopic("derive-oldest");
+
+    // max_buffer=3: publish 5 → keys for seq 2, 3, 4 remain (0, 1 pruned).
+    for (let i = 0; i < 5; i++) {
+      await publish(topic, `m${i}`, { max_buffer: 3 });
+    }
+
+    // Drop the cache, forcing derivation of both oldestSeq and nextSeq.
+    await runInDurableObject(getStub(topic), (instance) => {
+      (instance as unknown as { topicMetas: Map<string, unknown> }).topicMetas.clear();
+    });
+
+    // Next publish continues the sequence and prunes correctly.
+    const { body } = await publish(topic, "m5", { max_buffer: 3 });
+    expect(body.seq).toBe(5);
+
+    const msgKeys = await runInDurableObject(getStub(topic), async (_i, state) =>
+      [...(await state.storage.list({ prefix: "msg/t/" })).keys()]
+    );
+    // Buffer capped at 3 — seq 3, 4, 5 retained, older derived-and-pruned away.
+    expect(msgKeys).toHaveLength(3);
+  });
+
   it("rapid publishes all get unique sequence numbers", async () => {
     const { fullId: topic } = uniqueTopic("meta-rapid");
     const count = 20;
@@ -894,7 +952,7 @@ describe("Optimization — edge cases", () => {
       [...(await state.storage.list()).keys()]
     );
     // No message is ever written to storage — nothing to replay at buffer 0
-    expect(keys.some((k) => k.startsWith("msg:t:"))).toBe(false);
+    expect(keys.some((k) => k.startsWith("msg/t/"))).toBe(false);
     // ...but metadata is still persisted (stateful default)
     expect(keys).toContain("meta:t");
   });
@@ -1032,7 +1090,7 @@ describe("Optimization — ephemeral topics", () => {
       [...(await state.storage.list()).keys()]
     );
     // Topic stayed stateful — messages are still stored
-    expect(keys.some((k) => k.startsWith("msg:t:"))).toBe(true);
+    expect(keys.some((k) => k.startsWith("msg/t/"))).toBe(true);
   });
 });
 
